@@ -264,14 +264,19 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 - (void)rebuildMenu {
     NSMenu *menu = [[NSMenu alloc] init];
+    // Disable AppKit's automatic item validation — AppController is not in the
+    // responder chain, so autoenablesItems:YES (the default) would grey out
+    // every item because no validateMenuItem: is found during chain-walking.
+    [menu setAutoenablesItems:NO];
 
     // ① Toggle tap on/off
     NSString *title = _enabled ? @"PreClickFocus: Enabled" : @"PreClickFocus: Disabled";
     _toggleItem = [[NSMenuItem alloc] initWithTitle:title
                                              action:@selector(toggleEnabled:)
                                       keyEquivalent:@""];
-    _toggleItem.target = self;
-    _toggleItem.state  = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    _toggleItem.target  = self;
+    _toggleItem.state   = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    _toggleItem.enabled = YES;
     [menu addItem:_toggleItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
@@ -292,7 +297,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit"
                                                   action:@selector(terminate:)
                                            keyEquivalent:@"q"];
-    quit.target = NSApp;
+    quit.target  = NSApp;
+    quit.enabled = YES;
     [menu addItem:quit];
 
     _statusItem.menu = menu;
