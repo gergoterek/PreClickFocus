@@ -14,7 +14,9 @@
       "Bash(make)",
       "Bash(bash create-app-bundle.sh)",
       "Bash(make app *)",
-      "Bash(gh auth *)"
+      "Bash(gh auth *)",
+      "Bash(/usr/bin/git merge *)",
+      "Bash(/usr/bin/git stash *)"
     ]
   }
 }

@@ -127,6 +127,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CFMachPortRef       _tap;
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
+    BOOL                _userEnabled;   // YES = user wants the tap running; NO = user disabled it
     // Config
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
@@ -226,17 +227,17 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     [self loadConfig];
     [self logConfig];
 
-    // Check trust exactly once at launch — never re-polled after this point.
-    BOOL trusted = AXIsProcessTrusted();
+    // AXIsProcessTrustedWithOptions with prompt=YES does three things:
+    // 1. Registers the app in System Settings → Privacy & Security → Accessibility
+    // 2. Shows the native macOS permission dialog automatically when not trusted
+    // 3. Returns YES immediately (no dialog) when already trusted
+    NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+    BOOL trusted = (BOOL)AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
     if (trusted) {
-        // Install tap first so _enabled is correct when the menu is built.
         [self installEventTap];
     }
     [self setupStatusBar];
-    if (!trusted) {
-        // Show alert asynchronously so the run loop is already spinning.
-        dispatch_async(dispatch_get_main_queue(), ^{ [self promptForAccessibility]; });
-    }
+    // No custom alert needed — macOS handles the native permission flow above.
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -335,13 +336,13 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 - (void)toggleEnabled:(id)sender {
     if (_enabled) {
+        _userEnabled = NO;   // record intent before tearing down
         [self removeEventTap];
         _toggleItem.title = @"PreClickFocus: Disabled";
         _toggleItem.state = NSControlStateValueOff;
         printf("PreClickFocus: disabled\n");
     } else {
-        // installEventTap sets _enabled=YES on success, NO on failure (no permission).
-        // AXIsProcessTrusted() is intentionally not re-checked here per launch-only policy.
+        _userEnabled = YES;  // record intent before installing
         [self installEventTap];
         if (_enabled) {
             _toggleItem.title = @"PreClickFocus: Enabled";
@@ -377,7 +378,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, _tap, 0);
     CFRunLoopAddSource(CFRunLoopGetCurrent(), _tapSource, kCFRunLoopCommonModes);
     CGEventTapEnable(_tap, true);
-    _enabled = YES;
+    _enabled     = YES;
+    _userEnabled = YES;
     printf("PreClickFocus: running (PID %d)\n", getpid());
 }
 
@@ -396,6 +398,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 }
 
 - (void)reEnableTap {
+    if (!_userEnabled) return;  // user explicitly disabled — never auto-re-enable
     if (!_tap) return;
     if (!CFMachPortIsValid(_tap)) {
         // Port was invalidated by macOS (e.g., after repeated timeouts).
@@ -407,31 +410,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CGEventTapEnable(_tap, true);
 }
 
-// ── Accessibility alert ───────────────────────────────────────────────────────
-
-- (void)promptForAccessibility {
-    // Guard: never show UI if permission is already granted.
-    // This makes the method safe to call from any code path.
-    if (AXIsProcessTrusted()) return;
-
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText     = @"Accessibility Permission Required";
-    alert.informativeText =
-        @"PreClickFocus needs Accessibility access to focus windows on click.\n\n"
-        @"Open System Settings → Privacy & Security → Accessibility "
-        @"and enable PreClickFocus, then relaunch the app.";
-    alert.alertStyle = NSAlertStyleWarning;
-    [alert addButtonWithTitle:@"Open System Settings"];
-    [alert addButtonWithTitle:@"Later"];
-
-    NSModalResponse resp = [alert runModal];
-    if (resp == NSAlertFirstButtonReturn) {
-        [[NSWorkspace sharedWorkspace] openURL:
-            [NSURL URLWithString:
-             @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
-    }
-    // Continue running — do not quit.
-}
 
 @end
 
