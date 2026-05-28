@@ -353,7 +353,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 // ── Event tap management ──────────────────────────────────────────────────────
 
 - (void)installEventTap {
-    if (_tap) return; // already installed
+    // If a valid tap already exists, nothing to do.
+    if (_tap && CFMachPortIsValid(_tap)) return;
+    // Stale/invalid port — clean up before re-creating.
+    if (_tap) [self removeEventTap];
 
     CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown);
     _tap = CGEventTapCreate(
@@ -393,12 +396,24 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 }
 
 - (void)reEnableTap {
-    if (_tap) CGEventTapEnable(_tap, true);
+    if (!_tap) return;
+    if (!CFMachPortIsValid(_tap)) {
+        // Port was invalidated by macOS (e.g., after repeated timeouts).
+        // Tear down the dead tap and re-create it so _enabled stays in sync.
+        [self removeEventTap];
+        [self installEventTap];
+        return;
+    }
+    CGEventTapEnable(_tap, true);
 }
 
 // ── Accessibility alert ───────────────────────────────────────────────────────
 
 - (void)promptForAccessibility {
+    // Guard: never show UI if permission is already granted.
+    // This makes the method safe to call from any code path.
+    if (AXIsProcessTrusted()) return;
+
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText     = @"Accessibility Permission Required";
     alert.informativeText =
@@ -427,8 +442,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     AppController *controller = (__bridge AppController *)refcon;
 
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        // event is NULL for these pseudo-types; return NULL, not event.
         [controller reEnableTap];
-        return event;
+        return NULL;
     }
 
     if (type != kCGEventLeftMouseDown) return event;

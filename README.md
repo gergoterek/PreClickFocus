@@ -10,37 +10,40 @@ On macOS, clicking on a background window typically activates it but may not per
 
 ## Requirements
 
-- macOS 13 Ventura or later
-- Xcode 15+
+- macOS 12 Monterey or later
+- Xcode command-line tools (`xcode-select --install`)
 - Accessibility permission (granted in System Settings → Privacy & Security → Accessibility)
 
 ## Tech Stack
 
-- Swift 5.9+
+- Objective-C++ (`.mm`)
 - AppKit (menu bar, `NSStatusBar`, `NSRunningApplication`)
 - CoreGraphics (`CGEventTap` for system-wide click interception)
 - Accessibility APIs (`AXUIElement`, `AXIsProcessTrustedWithOptions`)
+- ServiceManagement (Launch at Login)
 
 ## Building
 
 ```bash
-# Open in Xcode
-open Package.swift
+# Build the .app bundle
+make
 
-# Or build from the command line
-swift build -c release
+# Or install the binary to /usr/local/bin
+make install
 ```
 
 > **Note:** The app must NOT be sandboxed. A system-wide `CGEventTap` (required for intercepting clicks before they reach other apps) is blocked by the macOS sandbox.
 
 ## Architecture
 
-| File | Responsibility |
-|------|---------------|
-| `main.swift` | NSApplication bootstrap, sets activation policy to `.accessory` (no Dock icon) |
-| `AppDelegate.swift` | App lifecycle; requests Accessibility permission on launch |
-| `StatusBarController.swift` | Menu bar icon and menu (Enable/Disable, Quit) |
-| `EventTapController.swift` | Installs `CGEventTap`; on `leftMouseDown`, raises non-frontmost window under cursor before forwarding the event |
+The entire app lives in a single `PreClickFocus.mm` file (Objective-C++) compiled with `clang++`.
+
+| Component | Responsibility |
+|-----------|---------------|
+| `main()` | NSApplication bootstrap, sets activation policy to `.accessory` (no Dock icon) |
+| `AppDelegate` | App lifecycle; checks Accessibility permission once at launch |
+| `StatusBarController` | Menu bar icon and menu (Enable/Disable, Launch at Login, Quit) |
+| `EventTapController` | Installs `CGEventTap`; on `leftMouseDown`, raises non-frontmost window under cursor before forwarding the event |
 
 ### Event flow
 

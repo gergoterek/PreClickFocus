@@ -13,7 +13,8 @@
       "Bash(make clean *)",
       "Bash(make)",
       "Bash(bash create-app-bundle.sh)",
-      "Bash(make app *)"
+      "Bash(make app *)",
+      "Bash(gh auth *)"
     ]
   }
 }
