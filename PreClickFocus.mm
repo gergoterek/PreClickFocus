@@ -99,6 +99,14 @@ static void focusAppWindow(pid_t pid, CGPoint point) {
     printf("PreClickFocus: focused PID %d (%s)\n", pid, name.UTF8String);
 }
 
+// ── Config ────────────────────────────────────────────────────────────────────
+
+typedef NS_ENUM(NSInteger, DisableKeyMode) {
+    DisableKeyControl = 0,   // skip focus when Control is held (default)
+    DisableKeyOption,        // skip focus when Option is held
+    DisableKeyNone,          // never skip based on modifier ("disabled")
+};
+
 // ── Forward declaration (callback needs AppController) ───────────────────────
 
 @class AppController;
@@ -109,7 +117,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 @interface AppController : NSObject
 - (void)setup;
-- (void)reEnableTap;   // called from C callback
+- (void)reEnableTap;                                          // called from C callback
+- (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event; // called from C callback
 @end
 
 @implementation AppController {
@@ -118,11 +127,105 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CFMachPortRef       _tap;
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
+    // Config
+    NSSet<NSString *>  *_ignoreApps;
+    DisableKeyMode      _disableKey;
+}
+
+// ── Config loading ────────────────────────────────────────────────────────────
+
+- (void)loadConfig {
+    // Defaults
+    _ignoreApps = [NSSet set];
+    _disableKey = DisableKeyControl;
+
+    NSString *path = [@"~/.PreClickFocus" stringByExpandingTildeInPath];
+    NSString *contents = [NSString stringWithContentsOfFile:path
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:nil];
+    if (!contents) return; // file absent — keep defaults
+
+    NSCharacterSet *newlines = [NSCharacterSet newlineCharacterSet];
+    NSCharacterSet *spaces   = [NSCharacterSet whitespaceCharacterSet];
+
+    for (NSString *rawLine in [contents componentsSeparatedByCharactersInSet:newlines]) {
+        NSString *line = [rawLine stringByTrimmingCharactersInSet:spaces];
+        if (line.length == 0 || [line hasPrefix:@"#"]) continue;
+
+        NSRange eq = [line rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+
+        NSString *key   = [[line substringToIndex:eq.location]
+                           stringByTrimmingCharactersInSet:spaces];
+        NSString *value = [[line substringFromIndex:eq.location + 1]
+                           stringByTrimmingCharactersInSet:spaces];
+
+        // Strip surrounding double-quotes (AutoRaise format: key="val")
+        if (value.length >= 2 && [value hasPrefix:@"\""] && [value hasSuffix:@"\""]) {
+            value = [value substringWithRange:NSMakeRange(1, value.length - 2)];
+        }
+
+        if ([key isEqualToString:@"ignoreApps"]) {
+            NSMutableSet *apps = [NSMutableSet set];
+            for (NSString *part in [value componentsSeparatedByString:@","]) {
+                NSString *name = [part stringByTrimmingCharactersInSet:spaces];
+                if (name.length > 0) [apps addObject:name];
+            }
+            _ignoreApps = [apps copy];
+
+        } else if ([key isEqualToString:@"disableKey"]) {
+            if ([value isEqualToString:@"option"]) {
+                _disableKey = DisableKeyOption;
+            } else if ([value isEqualToString:@"disabled"]) {
+                _disableKey = DisableKeyNone;
+            } else {
+                _disableKey = DisableKeyControl;
+            }
+        }
+    }
+}
+
+- (void)logConfig {
+    if (_ignoreApps.count > 0) {
+        NSString *list = [_ignoreApps.allObjects componentsJoinedByString:@", "];
+        printf("PreClickFocus: ignoreApps = %s\n", list.UTF8String);
+    } else {
+        printf("PreClickFocus: ignoreApps = (none)\n");
+    }
+
+    const char *keyName = "control";
+    if (_disableKey == DisableKeyOption) keyName = "option";
+    else if (_disableKey == DisableKeyNone) keyName = "disabled";
+    printf("PreClickFocus: disableKey = %s\n", keyName);
+}
+
+// ── Callback helper ───────────────────────────────────────────────────────────
+
+- (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event {
+    // 1. Modifier-key gate
+    if (_disableKey != DisableKeyNone) {
+        CGEventFlags flags = CGEventGetFlags(event);
+        if (_disableKey == DisableKeyControl && (flags & kCGEventFlagMaskControl))   return YES;
+        if (_disableKey == DisableKeyOption  && (flags & kCGEventFlagMaskAlternate)) return YES;
+    }
+
+    // 2. Ignored-app gate
+    if (_ignoreApps.count > 0) {
+        NSRunningApplication *app =
+            [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        NSString *name = app.localizedName;
+        if (name && [_ignoreApps containsObject:name]) return YES;
+    }
+
+    return NO;
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
 - (void)setup {
+    [self loadConfig];
+    [self logConfig];
+
     // Install tap first so _enabled is correct when the menu is built.
     if (AXIsProcessTrusted()) {
         [self installEventTap];
@@ -285,7 +388,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
     CGPoint point = CGEventGetLocation(event);
     pid_t pid = pidOfWindowUnderCursor(point);
-    if (pid != -1) {
+    if (pid != -1 && ![controller shouldSkipFocusForPID:pid event:event]) {
         focusAppWindow(pid, point);
     }
 
