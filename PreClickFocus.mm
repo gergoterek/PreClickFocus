@@ -226,14 +226,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     [self loadConfig];
     [self logConfig];
 
-    // Install tap first so _enabled is correct when the menu is built.
-    if (AXIsProcessTrusted()) {
+    // Check trust exactly once at launch — never re-polled after this point.
+    BOOL trusted = AXIsProcessTrusted();
+    if (trusted) {
+        // Install tap first so _enabled is correct when the menu is built.
         [self installEventTap];
     }
     [self setupStatusBar];
-
-    // If not trusted, show the alert asynchronously and keep running.
-    if (!AXIsProcessTrusted()) {
+    if (!trusted) {
+        // Show alert asynchronously so the run loop is already spinning.
         dispatch_async(dispatch_get_main_queue(), ^{ [self promptForAccessibility]; });
     }
 }
@@ -339,12 +340,12 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         _toggleItem.state = NSControlStateValueOff;
         printf("PreClickFocus: disabled\n");
     } else {
-        if (AXIsProcessTrusted()) {
-            [self installEventTap];
+        // installEventTap sets _enabled=YES on success, NO on failure (no permission).
+        // AXIsProcessTrusted() is intentionally not re-checked here per launch-only policy.
+        [self installEventTap];
+        if (_enabled) {
             _toggleItem.title = @"PreClickFocus: Enabled";
             _toggleItem.state = NSControlStateValueOn;
-        } else {
-            [self promptForAccessibility];
         }
     }
 }
