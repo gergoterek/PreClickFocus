@@ -9,8 +9,12 @@ static pid_t frontmostPID(void) {
     return app ? app.processIdentifier : -1;
 }
 
-// Returns the PID of the topmost normal window under the given screen point,
-// or -1 if none found or if it belongs to the frontmost app.
+// Returns the PID of the topmost normal (layer-0) window whose bounds contain
+// the given screen point, or -1 if none is found.
+// CGWindowListCopyWindowInfo returns windows front-to-back (index 0 = frontmost),
+// so the first matching entry is the topmost window at the cursor position.
+// Whether that window belongs to the frontmost app is intentionally NOT checked
+// here; that decision is made in the event-tap callback.
 static pid_t pidOfWindowUnderCursor(CGPoint point) {
     CFArrayRef windowList = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
@@ -18,22 +22,17 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
     if (!windowList) return -1;
 
     pid_t targetPID = -1;
-    pid_t front = frontmostPID();
 
     CFIndex count = CFArrayGetCount(windowList);
     for (CFIndex i = 0; i < count; i++) {
         NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(windowList, i);
 
-        // Only normal windows (layer 0)
+        // Only normal windows (layer 0); skip menu bars, overlays, system UI.
         NSNumber *layer = info[(__bridge NSString *)kCGWindowLayer];
         if (!layer || layer.integerValue != 0) continue;
 
         NSNumber *pidNum = info[(__bridge NSString *)kCGWindowOwnerPID];
         if (!pidNum) continue;
-        pid_t pid = (pid_t)pidNum.intValue;
-
-        // Skip the frontmost app's own windows
-        if (pid == front) continue;
 
         NSDictionary *bounds = info[(__bridge NSString *)kCGWindowBounds];
         if (!bounds) continue;
@@ -41,9 +40,8 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
         if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &rect)) continue;
 
         if (CGRectContainsPoint(rect, point)) {
-            // CGWindowListCopyWindowInfo returns windows front-to-back on screen,
-            // so the first match is the topmost one.
-            targetPID = pid;
+            // First match in front-to-back order = topmost window at cursor.
+            targetPID = (pid_t)pidNum.intValue;
             break;
         }
     }
@@ -430,7 +428,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
     CGPoint point = CGEventGetLocation(event);
     pid_t pid = pidOfWindowUnderCursor(point);
-    if (pid != -1 && ![controller shouldSkipFocusForPID:pid event:event]) {
+    // Skip if no window found, or if the topmost window already belongs to the
+    // frontmost app (normal click within the active app — nothing to do).
+    if (pid != -1 && pid != frontmostPID() &&
+        ![controller shouldSkipFocusForPID:pid event:event]) {
         focusAppWindow(pid, point);
     }
 
