@@ -8,7 +8,10 @@
       "Bash(/usr/bin/git init *)",
       "Bash(/usr/bin/git checkout *)",
       "Bash(/usr/bin/git add *)",
-      "Bash(/usr/bin/git commit *)"
+      "Bash(/usr/bin/git commit *)",
+      "Bash(/usr/bin/git push *)",
+      "Bash(make clean *)",
+      "Bash(make)"
     ]
   }
 }
