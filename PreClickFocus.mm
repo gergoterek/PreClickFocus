@@ -1,6 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 
+// ── Core focus logic (unchanged) ─────────────────────────────────────────────
+
 static pid_t frontmostPID(void) {
     NSRunningApplication *app = [[NSWorkspace sharedWorkspace] frontmostApplication];
     return app ? app.processIdentifier : -1;
@@ -97,9 +99,185 @@ static void focusAppWindow(pid_t pid, CGPoint point) {
     printf("PreClickFocus: focused PID %d (%s)\n", pid, name.UTF8String);
 }
 
-static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+// ── Forward declaration (callback needs AppController) ───────────────────────
+
+@class AppController;
+static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
+                                   CGEventRef event, void *refcon);
+
+// ── AppController ─────────────────────────────────────────────────────────────
+
+@interface AppController : NSObject
+- (void)setup;
+- (void)reEnableTap;   // called from C callback
+@end
+
+@implementation AppController {
+    NSStatusItem       *_statusItem;
+    NSMenuItem         *_toggleItem;
+    CFMachPortRef       _tap;
+    CFRunLoopSourceRef  _tapSource;
+    BOOL                _enabled;
+}
+
+// ── Public entry point ────────────────────────────────────────────────────────
+
+- (void)setup {
+    // Install tap first so _enabled is correct when the menu is built.
+    if (AXIsProcessTrusted()) {
+        [self installEventTap];
+    }
+    [self setupStatusBar];
+
+    // If not trusted, show the alert asynchronously and keep running.
+    if (!AXIsProcessTrusted()) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self promptForAccessibility]; });
+    }
+}
+
+// ── Status bar ────────────────────────────────────────────────────────────────
+
+- (void)setupStatusBar {
+    _statusItem = [[NSStatusBar systemStatusBar]
+                   statusItemWithLength:NSVariableStatusItemLength];
+
+    // Icon priority: SF Symbol "cursorarrow.click" → "cursorarrow.rays" → plain text.
+    // Note: "template" is a C++ keyword; use the setter [icon setTemplate:YES].
+    NSImage *icon = [NSImage imageWithSystemSymbolName:@"cursorarrow.click"
+                              accessibilityDescription:@"PreClickFocus"];
+    if (!icon) {
+        icon = [NSImage imageWithSystemSymbolName:@"cursorarrow.rays"
+                          accessibilityDescription:@"PreClickFocus"];
+    }
+    if (icon) {
+        [icon setTemplate:YES];
+        _statusItem.button.image = icon;
+    } else {
+        _statusItem.button.title = @"PCF";
+    }
+
+    [self rebuildMenu];
+}
+
+- (void)rebuildMenu {
+    NSMenu *menu = [[NSMenu alloc] init];
+
+    NSString *title = _enabled ? @"PreClickFocus: Enabled" : @"PreClickFocus: Disabled";
+    _toggleItem = [[NSMenuItem alloc] initWithTitle:title
+                                             action:@selector(toggleEnabled:)
+                                      keyEquivalent:@""];
+    _toggleItem.target = self;
+    _toggleItem.state  = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:_toggleItem];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit"
+                                                  action:@selector(terminate:)
+                                           keyEquivalent:@"q"];
+    quit.target = NSApp;
+    [menu addItem:quit];
+
+    _statusItem.menu = menu;
+}
+
+// ── Toggle ────────────────────────────────────────────────────────────────────
+
+- (void)toggleEnabled:(id)sender {
+    if (_enabled) {
+        [self removeEventTap];
+        _toggleItem.title = @"PreClickFocus: Disabled";
+        _toggleItem.state = NSControlStateValueOff;
+        printf("PreClickFocus: disabled\n");
+    } else {
+        if (AXIsProcessTrusted()) {
+            [self installEventTap];
+            _toggleItem.title = @"PreClickFocus: Enabled";
+            _toggleItem.state = NSControlStateValueOn;
+        } else {
+            [self promptForAccessibility];
+        }
+    }
+}
+
+// ── Event tap management ──────────────────────────────────────────────────────
+
+- (void)installEventTap {
+    if (_tap) return; // already installed
+
+    CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown);
+    _tap = CGEventTapCreate(
+        kCGHIDEventTap,
+        kCGHeadInsertEventTap,
+        kCGEventTapOptionDefault,
+        mask,
+        eventTapCallback,
+        (__bridge void *)self);   // pass self so callback can call reEnableTap
+
+    if (!_tap) {
+        fprintf(stderr, "PreClickFocus: failed to create event tap. "
+                        "Check Accessibility permission.\n");
+        _enabled = NO;
+        return;
+    }
+
+    _tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, _tap, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), _tapSource, kCFRunLoopCommonModes);
+    CGEventTapEnable(_tap, true);
+    _enabled = YES;
+    printf("PreClickFocus: running (PID %d)\n", getpid());
+}
+
+- (void)removeEventTap {
+    if (_tap) {
+        CGEventTapEnable(_tap, false);
+        if (_tapSource) {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), _tapSource, kCFRunLoopCommonModes);
+            CFRelease(_tapSource);
+            _tapSource = NULL;
+        }
+        CFRelease(_tap);
+        _tap = NULL;
+    }
+    _enabled = NO;
+}
+
+- (void)reEnableTap {
+    if (_tap) CGEventTapEnable(_tap, true);
+}
+
+// ── Accessibility alert ───────────────────────────────────────────────────────
+
+- (void)promptForAccessibility {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText     = @"Accessibility Permission Required";
+    alert.informativeText =
+        @"PreClickFocus needs Accessibility access to focus windows on click.\n\n"
+        @"Open System Settings → Privacy & Security → Accessibility "
+        @"and enable PreClickFocus, then relaunch the app.";
+    alert.alertStyle = NSAlertStyleWarning;
+    [alert addButtonWithTitle:@"Open System Settings"];
+    [alert addButtonWithTitle:@"Later"];
+
+    NSModalResponse resp = [alert runModal];
+    if (resp == NSAlertFirstButtonReturn) {
+        [[NSWorkspace sharedWorkspace] openURL:
+            [NSURL URLWithString:
+             @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
+    }
+    // Continue running — do not quit.
+}
+
+@end
+
+// ── Event tap callback ────────────────────────────────────────────────────────
+
+static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
+                                   CGEventRef event, void *refcon) {
+    AppController *controller = (__bridge AppController *)refcon;
+
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-        CGEventTapEnable((CFMachPortRef)refcon, true);
+        [controller reEnableTap];
         return event;
     }
 
@@ -114,78 +292,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return event;
 }
 
-static void checkAccessibilityPermission(void) {
-    NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
-    BOOL trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
-    if (!trusted) {
-        // Show a blocking alert so the user knows what to do.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSAlert *alert = [[NSAlert alloc] init];
-            alert.messageText = @"Accessibility Permission Required";
-            alert.informativeText =
-                @"PreClickFocus needs Accessibility access to focus windows on click.\n\n"
-                @"Open System Settings > Privacy & Security > Accessibility and enable PreClickFocus, "
-                @"then relaunch the app.";
-            alert.alertStyle = NSAlertStyleWarning;
-            [alert addButtonWithTitle:@"Open System Settings"];
-            [alert addButtonWithTitle:@"Quit"];
-            NSModalResponse resp = [alert runModal];
-            if (resp == NSAlertFirstButtonReturn) {
-                [[NSWorkspace sharedWorkspace] openURL:
-                    [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
-            }
-            [NSApp terminate:nil];
-        });
-    }
-}
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-        checkAccessibilityPermission();
-
-        // Install the event tap only if we're trusted.
-        if (AXIsProcessTrusted()) {
-            CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown);
-            CFMachPortRef tap = CGEventTapCreate(
-                kCGHIDEventTap,
-                kCGHeadInsertEventTap,
-                kCGEventTapOptionDefault,
-                mask,
-                eventTapCallback,
-                NULL);
-
-            if (!tap) {
-                fprintf(stderr, "PreClickFocus: failed to create event tap. Check Accessibility permission.\n");
-                return 1;
-            }
-
-            // Pass tap as refcon so the callback can re-enable it on timeout.
-            // CGEventTapCreate returns a retained MachPort; we store it in static so it
-            // stays alive for the lifetime of the process.
-            static CFMachPortRef globalTap;
-            globalTap = tap;
-
-            // Re-create tap with refcon set to itself now that we have the port.
-            CFRelease(tap);
-            tap = CGEventTapCreate(
-                kCGHIDEventTap,
-                kCGHeadInsertEventTap,
-                kCGEventTapOptionDefault,
-                mask,
-                eventTapCallback,
-                NULL);
-            globalTap = tap;
-
-            CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
-            CGEventTapEnable(tap, true);
-            CFRelease(src);
-
-            printf("PreClickFocus: running (PID %d)\n", getpid());
-        }
+        AppController *controller = [[AppController alloc] init];
+        [controller setup];
 
         [app run];
     }
