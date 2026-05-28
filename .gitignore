@@ -8,3 +8,6 @@ xcuserdata/
 build/
 *.o
 *.d
+# Compiled binaries
+/PreClickFocus
+PreClickFocus.app/Contents/MacOS/PreClickFocus

@@ -11,7 +11,9 @@
       "Bash(/usr/bin/git commit *)",
       "Bash(/usr/bin/git push *)",
       "Bash(make clean *)",
-      "Bash(make)"
+      "Bash(make)",
+      "Bash(bash create-app-bundle.sh)",
+      "Bash(make app *)"
     ]
   }
 }

@@ -1,4 +1,6 @@
 BINARY      = PreClickFocus
+APP_BUNDLE  = PreClickFocus.app
+APP_BINARY  = $(APP_BUNDLE)/Contents/MacOS/$(BINARY)
 SRC         = PreClickFocus.mm
 CXX         = clang++
 CXXFLAGS    = -ObjC++ -fobjc-arc \
@@ -9,15 +11,20 @@ CXXFLAGS    = -ObjC++ -fobjc-arc \
               -o $(BINARY)
 CODE_SIGN_IDENTITY =
 
-.PHONY: all clean install
+.PHONY: all app clean install
 
-all: $(BINARY)
+all: app
 
 $(BINARY): $(SRC) Info.plist
 	$(CXX) $(CXXFLAGS) $(SRC)
 
+app: $(BINARY)
+	mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	cp $(BINARY) $(APP_BINARY)
+
 clean:
 	rm -f $(BINARY)
+	rm -f $(APP_BINARY)
 
 install: $(BINARY)
 	cp $(BINARY) /usr/local/bin/$(BINARY)
