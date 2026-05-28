@@ -17,15 +17,17 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
     for (CFIndex i = 0; i < count; i++) {
         NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(windowList, i);
         NSNumber *layer = info[(__bridge NSString *)kCGWindowLayer];
-        if (!layer || layer.integerValue != 0) continue;
-        NSNumber *pidNum = info[(__bridge NSString *)kCGWindowOwnerPID];
-        if (!pidNum) continue;
+        if (!layer) continue;
         NSDictionary *bounds = info[(__bridge NSString *)kCGWindowBounds];
         if (!bounds) continue;
         CGRect rect;
         if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &rect)) continue;
         if (CGRectContainsPoint(rect, point)) {
-            targetPID = (pid_t)pidNum.intValue;
+            if (layer.integerValue == 0) {
+                NSNumber *pidNum = info[(__bridge NSString *)kCGWindowOwnerPID];
+                if (pidNum) targetPID = (pid_t)pidNum.intValue;
+            }
+            // else: menu or overlay on top — return -1 (no focus)
             break;
         }
     }
