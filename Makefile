@@ -7,6 +7,7 @@ CXXFLAGS    = -ObjC++ -fobjc-arc \
               -framework Cocoa \
               -framework ApplicationServices \
               -framework Carbon \
+              -framework ServiceManagement \
               -mmacosx-version-min=12.0 \
               -o $(BINARY)
 CODE_SIGN_IDENTITY =

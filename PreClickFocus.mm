@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <ServiceManagement/ServiceManagement.h>
 
 // ── Core focus logic (unchanged) ─────────────────────────────────────────────
 
@@ -124,6 +125,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 @implementation AppController {
     NSStatusItem       *_statusItem;
     NSMenuItem         *_toggleItem;
+    NSMenuItem         *_loginItem;
     CFMachPortRef       _tap;
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
@@ -265,6 +267,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)rebuildMenu {
     NSMenu *menu = [[NSMenu alloc] init];
 
+    // ① Toggle tap on/off
     NSString *title = _enabled ? @"PreClickFocus: Enabled" : @"PreClickFocus: Disabled";
     _toggleItem = [[NSMenuItem alloc] initWithTitle:title
                                              action:@selector(toggleEnabled:)
@@ -275,6 +278,19 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
     [menu addItem:[NSMenuItem separatorItem]];
 
+    // ② Launch at Login (SMAppService, macOS 13+)
+    _loginItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login"
+                                            action:@selector(toggleLoginItem:)
+                                     keyEquivalent:@""];
+    _loginItem.target  = self;
+    _loginItem.state   = [self loginItemEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    if (@available(macOS 13.0, *)) { _loginItem.enabled = YES; }
+    else                           { _loginItem.enabled = NO;  }
+    [menu addItem:_loginItem];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // ③ Quit
     NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit"
                                                   action:@selector(terminate:)
                                            keyEquivalent:@"q"];
@@ -282,6 +298,32 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     [menu addItem:quit];
 
     _statusItem.menu = menu;
+}
+
+// ── Login item (SMAppService, macOS 13+) ──────────────────────────────────────
+
+- (BOOL)loginItemEnabled {
+    if (@available(macOS 13.0, *)) {
+        return [SMAppService mainAppService].status == SMAppServiceStatusEnabled;
+    }
+    return NO;
+}
+
+- (void)toggleLoginItem:(id)sender {
+    if (@available(macOS 13.0, *)) {
+        SMAppService *service = [SMAppService mainAppService];
+        NSError *error = nil;
+        if (service.status == SMAppServiceStatusEnabled) {
+            [service unregisterAndReturnError:&error];
+        } else {
+            [service registerAndReturnError:&error];
+        }
+        if (error) {
+            NSLog(@"PreClickFocus: login item toggle failed: %@", error.localizedDescription);
+        }
+        // Reflect updated state in the menu item.
+        _loginItem.state = [self loginItemEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    }
 }
 
 // ── Toggle ────────────────────────────────────────────────────────────────────
