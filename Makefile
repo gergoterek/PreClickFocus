@@ -22,6 +22,7 @@ $(BINARY): $(SRC) Info.plist
 app: $(BINARY)
 	mkdir -p $(APP_BUNDLE)/Contents/MacOS
 	cp $(BINARY) $(APP_BINARY)
+	codesign --force --deep --sign - $(APP_BUNDLE)
 
 clean:
 	rm -f $(BINARY)
