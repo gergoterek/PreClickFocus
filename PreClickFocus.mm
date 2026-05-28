@@ -227,17 +227,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     [self loadConfig];
     [self logConfig];
 
-    // AXIsProcessTrustedWithOptions with prompt=YES does three things:
-    // 1. Registers the app in System Settings → Privacy & Security → Accessibility
-    // 2. Shows the native macOS permission dialog automatically when not trusted
-    // 3. Returns YES immediately (no dialog) when already trusted
-    NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
-    BOOL trusted = (BOOL)AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    BOOL trusted = AXIsProcessTrusted();
+    if (!trusted) {
+        NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+        AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    }
     if (trusted) {
         [self installEventTap];
     }
     [self setupStatusBar];
-    // No custom alert needed — macOS handles the native permission flow above.
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
