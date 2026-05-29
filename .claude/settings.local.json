@@ -16,7 +16,25 @@
       "Bash(make app *)",
       "Bash(gh auth *)",
       "Bash(/usr/bin/git merge *)",
-      "Bash(/usr/bin/git stash *)"
+      "Bash(/usr/bin/git stash *)",
+      "Bash(xcodebuild -version)",
+      "Bash(xcodebuild -showsdks)",
+      "Bash(swift --version)",
+      "Bash(xcrun --find clang)",
+      "Bash(brew install *)",
+      "Bash(xcodegen generate *)",
+      "Bash(xcodebuild -list -project MicRack.xcodeproj)",
+      "Bash(xcodebuild -project MicRack.xcodeproj -scheme MicRack -configuration Debug -derivedDataPath DerivedData build)",
+      "Read(//private/tmp/mrtest/**)",
+      "Bash(clang -I /Users/gergoterek/Movies/OBS/Claude/MicRack/MicRack mrtest.c -framework AudioToolbox -framework CoreAudio -o mrtest)",
+      "Bash(./mrtest)",
+      "Bash(lipo -archs /Users/gergoterek/Movies/OBS/Claude/MicRack/DerivedData/Build/Products/Debug/MicRack.app/Contents/MacOS/MicRack)",
+      "Bash(codesign -dv /Users/gergoterek/Movies/OBS/Claude/MicRack/DerivedData/Build/Products/Debug/MicRack.app)",
+      "Bash(git commit -q -m 'Phase 1: clean mic→virtual-device passthrough on OBS-style HAL + AudioConverter core *)",
+      "Bash(xcrun --show-sdk-version)",
+      "Bash(sw_vers -productVersion)",
+      "Read(//Library/Developer/CommandLineTools/SDKs/**)",
+      "Read(//Applications/**)"
     ]
   }
 }

@@ -38,6 +38,13 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
 static void focusAppWindow(pid_t pid, CGPoint point) {
     AXUIElementRef appElement = AXUIElementCreateApplication(pid);
     if (!appElement) return;
+    // Bound worst-case latency: every AXUIElementCopyAttributeValue below is a
+    // synchronous IPC round-trip to the target app, and this runs inside the
+    // event tap callback that gates click delivery. The default AX messaging
+    // timeout is multi-second, so a busy/unresponsive target app could stall
+    // the user's click that long. Cap it at 250 ms — well above a healthy
+    // app's response time, but short enough to never feel frozen.
+    AXUIElementSetMessagingTimeout(appElement, 0.25f);
     CFArrayRef windows = NULL;
     AXError err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute, (CFTypeRef *)&windows);
     if (err != kAXErrorSuccess || !windows) { CFRelease(appElement); return; }
