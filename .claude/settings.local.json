@@ -68,7 +68,8 @@
       "Bash(git commit -q -m 'Phase B: aggregate device is the primary audio path \\(dual-unit -> fallback\\) *)",
       "Bash(git checkout *)",
       "Bash(git merge --no-ff aggregate-spike -m 'Merge aggregate-spike: aggregate device is the primary audio path *)",
-      "Bash(git commit -q -m 'Fix device-change stutter: relevance filter + atomic serialized rebuild *)"
+      "Bash(git commit -q -m 'Fix device-change stutter: relevance filter + atomic serialized rebuild *)",
+      "Bash(git commit -q -m 'Fix quit hang: dedicated listener queue \\(no main-thread deadlock\\) + robust shutdown *)"
     ]
   }
 }

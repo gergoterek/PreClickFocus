@@ -110,6 +110,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup;
 - (void)reEnableTap;
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event;
+- (BOOL)hoverPrimingEnabled;
 @end
 
 @implementation AppController {
@@ -120,11 +121,13 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
     BOOL                _userEnabled;
+    BOOL                _hoverPrimingEnabled;   // default YES
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
 }
 
 - (void)loadConfig {
+    _hoverPrimingEnabled = YES;
     _ignoreApps = [NSSet set];
     _disableKey = DisableKeyControl;
     NSString *path = [@"~/.PreClickFocus" stringByExpandingTildeInPath];
@@ -153,6 +156,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             if ([value isEqualToString:@"option"])        _disableKey = DisableKeyOption;
             else if ([value isEqualToString:@"disabled"]) _disableKey = DisableKeyNone;
             else                                          _disableKey = DisableKeyControl;
+        } else if ([key isEqualToString:@"hoverPriming"]) {
+            _hoverPrimingEnabled = ![value isEqualToString:@"false"];
         }
     }
 }
@@ -165,7 +170,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     const char *keyName = (_disableKey == DisableKeyOption) ? "option" :
                           (_disableKey == DisableKeyNone)   ? "disabled" : "control";
     printf("PreClickFocus: disableKey = %s\n", keyName);
+    printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
 }
+
+- (BOOL)hoverPrimingEnabled { return _hoverPrimingEnabled; }
 
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event {
     if (_disableKey != DisableKeyNone) {
@@ -211,6 +219,12 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _toggleItem.state   = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
     _toggleItem.enabled = YES;
     [menu addItem:_toggleItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *hoverItem = [[NSMenuItem alloc] initWithTitle:@"Hover Priming" action:@selector(toggleHoverPriming:) keyEquivalent:@""];
+    hoverItem.target  = self;
+    hoverItem.state   = _hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    hoverItem.enabled = YES;
+    [menu addItem:hoverItem];
     [menu addItem:[NSMenuItem separatorItem]];
     _loginItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login" action:@selector(toggleLoginItem:) keyEquivalent:@""];
     _loginItem.target  = self;
@@ -258,6 +272,12 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             _toggleItem.state = NSControlStateValueOn;
         }
     }
+}
+
+- (void)toggleHoverPriming:(id)sender {
+    _hoverPrimingEnabled = !_hoverPrimingEnabled;
+    [sender setState:_hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+    printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
 }
 
 - (void)installEventTap {
@@ -320,13 +340,18 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     if (pid != -1 && pid != frontmostPID() &&
         ![controller shouldSkipFocusForPID:pid event:event]) {
         focusAppWindow(pid, point, hitTestMs);
-        // Prime hover/tracking state at the cursor position so hover-dependent
-        // UI elements react to the click that is about to be delivered.
-        CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
-                                                  point, kCGMouseButtonLeft);
-        if (move) {
-            CGEventPost(kCGHIDEventTap, move);
-            CFRelease(move);
+        if ([controller hoverPrimingEnabled]) {
+            // Two synthetic mouseMoved events: a 1px nudge then the exact point.
+            // The nudge+return sequence reliably triggers NSTrackingArea
+            // mouseEntered/mouseMoved so hover-highlight state is set before the
+            // real click arrives.
+            CGEventRef move1 = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                       CGPointMake(point.x + 1, point.y),
+                                                       kCGMouseButtonLeft);
+            CGEventRef move2 = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                       point, kCGMouseButtonLeft);
+            if (move1) { CGEventPost(kCGHIDEventTap, move1); CFRelease(move1); }
+            if (move2) { CGEventPost(kCGHIDEventTap, move2); CFRelease(move2); }
         }
     }
     return event;
