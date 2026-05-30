@@ -2,6 +2,14 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <ServiceManagement/ServiceManagement.h>
 
+// ── TEMP PROFILING — remove after measurement ────────────────────────────────
+// Monotonic milliseconds. CLOCK_UPTIME_RAW excludes sleep and isn't subject to
+// NTP adjustments, so phase deltas are accurate.
+static double nowMs(void) {
+    return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1.0e6;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 static pid_t frontmostPID(void) {
     NSRunningApplication *app = [[NSWorkspace sharedWorkspace] frontmostApplication];
     return app ? app.processIdentifier : -1;
@@ -35,7 +43,8 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
     return targetPID;
 }
 
-static void focusAppWindow(pid_t pid, CGPoint point) {
+static void focusAppWindow(pid_t pid, CGPoint point, double hitTestMs) {
+    double tStart = nowMs();   // TEMP PROFILING
     AXUIElementRef appElement = AXUIElementCreateApplication(pid);
     if (!appElement) return;
     // Bound worst-case latency: every AXUIElementCopyAttributeValue below is a
@@ -71,10 +80,20 @@ static void focusAppWindow(pid_t pid, CGPoint point) {
     }
     CFRelease(windows);
     CFRelease(appElement);
+    double tRaise = nowMs();   // TEMP PROFILING — end of AX enumeration + raise
     NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     NSString *name = app.localizedName ?: @"?";
+    double tLookup = nowMs();  // TEMP PROFILING — end of running-app + name lookup
     [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-    printf("PreClickFocus: focused PID %d (%s)\n", pid, name.UTF8String);
+    double tActivate = nowMs(); // TEMP PROFILING — end of activation
+    // TEMP PROFILING — one consolidated breakdown line per focus event.
+    printf("PreClickFocus: focused PID %d (%s) | hit-test %.1fms AX-raise %.1fms lookup %.1fms activate %.1fms total %.1fms\n",
+           pid, name.UTF8String,
+           hitTestMs,
+           tRaise - tStart,
+           tLookup - tRaise,
+           tActivate - tLookup,
+           hitTestMs + (tActivate - tStart));
 }
 
 typedef NS_ENUM(NSInteger, DisableKeyMode) {
@@ -295,10 +314,20 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     }
     if (type != kCGEventLeftMouseDown) return event;
     CGPoint point = CGEventGetLocation(event);
+    double tHit0 = nowMs();   // TEMP PROFILING
     pid_t pid = pidOfWindowUnderCursor(point);
+    double hitTestMs = nowMs() - tHit0;  // TEMP PROFILING
     if (pid != -1 && pid != frontmostPID() &&
         ![controller shouldSkipFocusForPID:pid event:event]) {
-        focusAppWindow(pid, point);
+        focusAppWindow(pid, point, hitTestMs);
+        // Prime hover/tracking state at the cursor position so hover-dependent
+        // UI elements react to the click that is about to be delivered.
+        CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                  point, kCGMouseButtonLeft);
+        if (move) {
+            CGEventPost(kCGHIDEventTap, move);
+            CFRelease(move);
+        }
     }
     return event;
 }
