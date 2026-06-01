@@ -363,29 +363,27 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             // before the click arrives. No interaction with the in-flight event.
             int64_t clickState = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
             dispatch_async(dispatch_get_main_queue(), ^{
-                // 1. Post mouseMoved immediately to prime hover state.
-                CGEventRef mv = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
-                                                        point, kCGMouseButtonLeft);
-                if (mv) {
-                    CGEventSetIntegerValueField(mv, kCGEventSourceUserData, kPCFSyntheticTag);
-                    CGEventPost(kCGHIDEventTap, mv);
-                    CFRelease(mv);
-                }
-                // 2. After 150ms post mouseDown + mouseUp to complete the click.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                // Step 1: physically move cursor 2px to trigger real hover detection
+                CGDisplayMoveCursorToPoint(CGMainDisplayID(),
+                                           CGPointMake(point.x + 2, point.y));
+
+                // Step 2: wait 150ms for hover state to settle, then click + restore
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(150 * NSEC_PER_MSEC)),
                                dispatch_get_main_queue(), ^{
+
+                    // Move cursor back to exact click position
+                    CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+
+                    // Post the click at original position
                     CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
                                                               point, kCGMouseButtonLeft);
                     CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
                                                               point, kCGMouseButtonLeft);
-                    if (down) {
-                        CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
-                        CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
-                    }
-                    if (up) {
-                        CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
-                        CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
-                    }
+                    if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
+                    if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
+                    if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
+                    if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
                     if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
                     if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
                 });
