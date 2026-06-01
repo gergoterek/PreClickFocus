@@ -7,11 +7,6 @@ static pid_t frontmostPID(void) {
     return app ? app.processIdentifier : -1;
 }
 
-// Returns the PID of the topmost normal (layer-0) window under the cursor, or
-// -1 if the topmost object there is not a normal window (a menu, overlay, or
-// system UI), or if nothing is found. Iterates front-to-back and stops at the
-// FIRST object whose bounds contain the point — never skips a menu/overlay to
-// reach a window behind it, so menu-bar menu clicks don't pass through.
 static pid_t pidOfWindowUnderCursor(CGPoint point) {
     CFArrayRef windowList = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
@@ -40,17 +35,9 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
     return targetPID;
 }
 
-// Raise and activate the window of the given app that is under the cursor.
 static void focusAppWindow(pid_t pid, CGPoint point) {
     AXUIElementRef appElement = AXUIElementCreateApplication(pid);
     if (!appElement) return;
-    // Bound worst-case latency: every AXUIElementCopyAttributeValue below is a
-    // synchronous IPC round-trip to the target app, and this runs inside the
-    // event tap callback that gates click delivery. The default AX messaging
-    // timeout is multi-second, so a busy/unresponsive target app could stall
-    // the user's click that long. Cap it at 250 ms — well above a healthy
-    // app's response time, but short enough to never feel frozen.
-    AXUIElementSetMessagingTimeout(appElement, 0.25f);
     CFArrayRef windows = NULL;
     AXError err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute, (CFTypeRef *)&windows);
     if (err != kAXErrorSuccess || !windows) { CFRelease(appElement); return; }
@@ -171,13 +158,33 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup {
     [self loadConfig];
     [self logConfig];
+    [self setupStatusBar];
+
     if (AXIsProcessTrusted()) {
         [self installEventTap];
-    } else {
-        NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
-        AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+        return;
     }
-    [self setupStatusBar];
+
+    // Not yet trusted: show the system prompt once...
+    NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+    AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+
+    // ...then poll until permission is granted and install the tap live.
+    __weak AppController *weakSelf = self;
+    static NSTimer *trustTimer = nil;
+    trustTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                 repeats:YES
+                                                   block:^(NSTimer *t) {
+        if (AXIsProcessTrusted()) {
+            [t invalidate];
+            AppController *s = weakSelf;
+            if (s) {
+                [s installEventTap];
+                [s rebuildMenu];
+                printf("PreClickFocus: permission granted, tap installed\n");
+            }
+        }
+    }];
 }
 
 - (void)setupStatusBar {
@@ -306,7 +313,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         ![controller shouldSkipFocusForPID:pid event:event]) {
         focusAppWindow(pid, point);
     }
-    // Always deliver the original click unchanged — never consume a real mouse-down.
     return event;
 }
 
