@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <math.h>
 
 // ── TEMP PROFILING — remove after measurement ────────────────────────────────
 // Monotonic milliseconds. CLOCK_UPTIME_RAW excludes sleep and isn't subject to
@@ -111,7 +112,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)reEnableTap;
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event;
 - (BOOL)hoverPrimingEnabled;
+- (NSInteger)preNudgeMs;
 - (NSInteger)hoverWaitMs;
+- (NSInteger)clickWaitMs;
 @end
 
 @implementation AppController {
@@ -123,15 +126,21 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     BOOL                _enabled;
     BOOL                _userEnabled;
     BOOL                _hoverPrimingEnabled;   // default NO (fast path)
-    NSInteger           _hoverWaitMs;           // default 300 — single wait between cursor move and click
-    NSTextField        *_hoverWaitLabel;        // shows current ms value next to the slider
+    NSInteger           _preNudgeMs;            // default 80  — wait after focus before moving cursor
+    NSInteger           _hoverWaitMs;           // default 300 — wait after cursor move for hover/popup
+    NSInteger           _clickWaitMs;           // default 50  — wait before posting the synthetic click
+    NSTextField        *_preNudgeLabel;         // live ms label for the pre-nudge slider
+    NSTextField        *_hoverWaitLabel;        // live ms label for the hover-wait slider
+    NSTextField        *_clickWaitLabel;        // live ms label for the click-wait slider
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
 }
 
 - (void)loadConfig {
     _hoverPrimingEnabled = NO;
+    _preNudgeMs  = 80;
     _hoverWaitMs = 300;
+    _clickWaitMs = 50;
     _ignoreApps = [NSSet set];
     _disableKey = DisableKeyControl;
     NSString *path = [@"~/.PreClickFocus" stringByExpandingTildeInPath];
@@ -162,11 +171,18 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             else                                          _disableKey = DisableKeyControl;
         } else if ([key isEqualToString:@"hoverPriming"]) {
             _hoverPrimingEnabled = [value isEqualToString:@"true"];
+        } else if ([key isEqualToString:@"preNudgeMs"]) {
+            NSInteger v = value.integerValue;
+            if (v < 0) v = 0; if (v > 2000) v = 2000;
+            _preNudgeMs = v;
         } else if ([key isEqualToString:@"hoverWaitMs"]) {
             NSInteger v = value.integerValue;
-            if (v < 0)    v = 0;
-            if (v > 2000) v = 2000;
+            if (v < 0) v = 0; if (v > 2000) v = 2000;
             _hoverWaitMs = v;
+        } else if ([key isEqualToString:@"clickWaitMs"]) {
+            NSInteger v = value.integerValue;
+            if (v < 0) v = 0; if (v > 2000) v = 2000;
+            _clickWaitMs = v;
         }
     }
 }
@@ -180,11 +196,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                           (_disableKey == DisableKeyNone)   ? "disabled" : "control";
     printf("PreClickFocus: disableKey = %s\n", keyName);
     printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
+    printf("PreClickFocus: preNudgeMs = %ld\n", (long)_preNudgeMs);
     printf("PreClickFocus: hoverWaitMs = %ld\n", (long)_hoverWaitMs);
+    printf("PreClickFocus: clickWaitMs = %ld\n", (long)_clickWaitMs);
 }
 
 - (BOOL)hoverPrimingEnabled    { return _hoverPrimingEnabled; }
+- (NSInteger)preNudgeMs        { return _preNudgeMs; }
 - (NSInteger)hoverWaitMs       { return _hoverWaitMs; }
+- (NSInteger)clickWaitMs       { return _clickWaitMs; }
 
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event {
     if (_disableKey != DisableKeyNone) {
@@ -247,8 +267,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     hoverEnabledItem.enabled = YES;
     [hoverSub addItem:hoverEnabledItem];
     [hoverSub addItem:[NSMenuItem separatorItem]];
-    // Single adjustable hover-wait delay, controlled by an embedded NSSlider.
-    [hoverSub addItem:[self buildHoverWaitSliderItem]];
+    // Three independently adjustable delays, each with its own embedded NSSlider.
+    [hoverSub addItem:[self sliderItemWithTitle:@"Pre-nudge"  value:_preNudgeMs  label:&_preNudgeLabel  action:@selector(preNudgeSliderChanged:)]];
+    [hoverSub addItem:[self sliderItemWithTitle:@"Hover wait" value:_hoverWaitMs label:&_hoverWaitLabel action:@selector(hoverWaitSliderChanged:)]];
+    [hoverSub addItem:[self sliderItemWithTitle:@"Click wait" value:_clickWaitMs label:&_clickWaitLabel action:@selector(clickWaitSliderChanged:)]];
     [hoverSub addItem:[NSMenuItem separatorItem]];
     hoverParent.submenu = hoverSub;
     [menu addItem:hoverParent];
@@ -307,46 +329,52 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
 }
 
-- (NSMenuItem *)buildHoverWaitSliderItem {
+// Generic builder for a labeled NSSlider menu item (0–2000 ms, continuous).
+// The label reference is stored via labelOut so the slider action can update
+// it live without rebuilding the menu (which would destroy the slider mid-drag).
+- (NSMenuItem *)sliderItemWithTitle:(NSString *)title
+                              value:(NSInteger)value
+                              label:(NSTextField * __strong *)labelOut
+                             action:(SEL)action {
     NSMenuItem *item = [[NSMenuItem alloc] init];
     item.enabled = YES;
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 240, 56)];
 
-    // Container view holding the label + slider.
-    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 220, 56)];
+    NSTextField *label = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 32, 200, 18)];
+    label.editable        = NO;
+    label.selectable      = NO;
+    label.bordered        = NO;
+    label.backgroundColor = [NSColor clearColor];
+    label.stringValue     = [NSString stringWithFormat:@"%@: %ld ms", title, (long)value];
+    [container addSubview:label];
 
-    // Label: "Hover wait: 300 ms"
-    _hoverWaitLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 32, 180, 18)];
-    _hoverWaitLabel.editable        = NO;
-    _hoverWaitLabel.selectable      = NO;
-    _hoverWaitLabel.bordered        = NO;
-    _hoverWaitLabel.backgroundColor = [NSColor clearColor];
-    _hoverWaitLabel.stringValue     = [NSString stringWithFormat:@"Hover wait: %ld ms", (long)_hoverWaitMs];
-    [container addSubview:_hoverWaitLabel];
-
-    // Slider: 0–2000 ms, continuous so the label updates live while dragging.
-    NSSlider *slider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 6, 180, 22)];
+    NSSlider *slider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 8, 200, 20)];
     slider.minValue    = 0;
     slider.maxValue    = 2000;
-    slider.doubleValue = (double)_hoverWaitMs;
+    slider.doubleValue = (double)value;
     slider.continuous  = YES;
     slider.target      = self;
-    slider.action      = @selector(hoverWaitSliderChanged:);
+    slider.action      = action;
     [container addSubview:slider];
 
     item.view = container;
+    *labelOut = label;
     return item;
 }
 
-- (void)hoverWaitSliderChanged:(NSSlider *)sender {
-    // Round to the nearest 10 ms and clamp to the valid range.
-    NSInteger v = ((NSInteger)(sender.doubleValue + 5) / 10) * 10;
-    if (v < 0)    v = 0;
-    if (v > 2000) v = 2000;
-    _hoverWaitMs = v;
-    // Live-update the label only — do NOT rebuild the menu, which would destroy
-    // the slider view mid-drag.
+- (void)preNudgeSliderChanged:(NSSlider *)s {
+    _preNudgeMs = (NSInteger)llround(s.doubleValue / 10.0) * 10;
+    _preNudgeLabel.stringValue = [NSString stringWithFormat:@"Pre-nudge: %ld ms", (long)_preNudgeMs];
+}
+
+- (void)hoverWaitSliderChanged:(NSSlider *)s {
+    _hoverWaitMs = (NSInteger)llround(s.doubleValue / 10.0) * 10;
     _hoverWaitLabel.stringValue = [NSString stringWithFormat:@"Hover wait: %ld ms", (long)_hoverWaitMs];
-    printf("PreClickFocus: hoverWaitMs = %ld\n", (long)_hoverWaitMs);
+}
+
+- (void)clickWaitSliderChanged:(NSSlider *)s {
+    _clickWaitMs = (NSInteger)llround(s.doubleValue / 10.0) * 10;
+    _clickWaitLabel.stringValue = [NSString stringWithFormat:@"Click wait: %ld ms", (long)_clickWaitMs];
 }
 
 - (void)installEventTap {
@@ -420,31 +448,34 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
         if ([controller hoverPrimingEnabled]) {
             // MODE 2 — Hover Priming ON (slow path, reliable hover state):
-            // Consume the original click and replace it with a physical cursor
-            // move → single adjustable wait → synthetic down + up, so the target
-            // view has time to register hover state / show popups before the click.
+            // Consume the original click and replace it with a three-stage
+            // sequence: wait preNudge → move cursor → wait hoverWait → wait
+            // clickWait → synthetic down + up. Each stage is independently
+            // tunable so apps with different hover/popup timing can be dialed in.
             int64_t clickState = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
-            NSInteger wait     = [controller hoverWaitMs];  // capture before async
+            NSInteger preN   = [controller preNudgeMs];   // capture before async
+            NSInteger hoverW = [controller hoverWaitMs];
+            NSInteger clickW = [controller clickWaitMs];
             dispatch_async(dispatch_get_main_queue(), ^{
-                // Physically move the cursor to the click point — this triggers real
-                // hover/tracking detection in all apps (including Chrome/Electron).
-                CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
-
-                // Wait the single adjustable delay for hover state / popups to appear.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)(wait * NSEC_PER_MSEC)),
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(preN * NSEC_PER_MSEC)),
                                dispatch_get_main_queue(), ^{
-
-                    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
-                                                              point, kCGMouseButtonLeft);
-                    CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
-                                                              point, kCGMouseButtonLeft);
-                    if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
-                    if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
-                    if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
-                    if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
-                    if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
-                    if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+                    // Physically move the cursor to the click point — triggers real
+                    // hover/tracking detection in all apps (including Chrome/Electron).
+                    CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hoverW * NSEC_PER_MSEC)),
+                                   dispatch_get_main_queue(), ^{
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(clickW * NSEC_PER_MSEC)),
+                                       dispatch_get_main_queue(), ^{
+                            CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
+                            CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, point, kCGMouseButtonLeft);
+                            if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
+                            if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
+                            if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
+                            if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
+                            if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
+                            if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+                        });
+                    });
                 });
             });
             return NULL; // original consumed; synthetic sequence replaces it
