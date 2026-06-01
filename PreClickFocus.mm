@@ -2,19 +2,16 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <ServiceManagement/ServiceManagement.h>
 
-// ── TEMP PROFILING — remove after measurement ────────────────────────────────
-// Monotonic milliseconds. CLOCK_UPTIME_RAW excludes sleep and isn't subject to
-// NTP adjustments, so phase deltas are accurate.
-static double nowMs(void) {
-    return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1.0e6;
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
 static pid_t frontmostPID(void) {
     NSRunningApplication *app = [[NSWorkspace sharedWorkspace] frontmostApplication];
     return app ? app.processIdentifier : -1;
 }
 
+// Returns the PID of the topmost normal (layer-0) window under the cursor, or
+// -1 if the topmost object there is not a normal window (a menu, overlay, or
+// system UI), or if nothing is found. Iterates front-to-back and stops at the
+// FIRST object whose bounds contain the point — never skips a menu/overlay to
+// reach a window behind it, so menu-bar menu clicks don't pass through.
 static pid_t pidOfWindowUnderCursor(CGPoint point) {
     CFArrayRef windowList = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
@@ -43,8 +40,8 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
     return targetPID;
 }
 
-static void focusAppWindow(pid_t pid, CGPoint point, double hitTestMs) {
-    double tStart = nowMs();   // TEMP PROFILING
+// Raise and activate the window of the given app that is under the cursor.
+static void focusAppWindow(pid_t pid, CGPoint point) {
     AXUIElementRef appElement = AXUIElementCreateApplication(pid);
     if (!appElement) return;
     // Bound worst-case latency: every AXUIElementCopyAttributeValue below is a
@@ -80,20 +77,10 @@ static void focusAppWindow(pid_t pid, CGPoint point, double hitTestMs) {
     }
     CFRelease(windows);
     CFRelease(appElement);
-    double tRaise = nowMs();   // TEMP PROFILING — end of AX enumeration + raise
     NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     NSString *name = app.localizedName ?: @"?";
-    double tLookup = nowMs();  // TEMP PROFILING — end of running-app + name lookup
     [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-    double tActivate = nowMs(); // TEMP PROFILING — end of activation
-    // TEMP PROFILING — one consolidated breakdown line per focus event.
-    printf("PreClickFocus: focused PID %d (%s) | hit-test %.1fms AX-raise %.1fms lookup %.1fms activate %.1fms total %.1fms\n",
-           pid, name.UTF8String,
-           hitTestMs,
-           tRaise - tStart,
-           tLookup - tRaise,
-           tActivate - tLookup,
-           hitTestMs + (tActivate - tStart));
+    printf("PreClickFocus: focused PID %d (%s)\n", pid, name.UTF8String);
 }
 
 typedef NS_ENUM(NSInteger, DisableKeyMode) {
@@ -110,8 +97,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup;
 - (void)reEnableTap;
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event;
-- (BOOL)hoverPrimingEnabled;
-- (NSInteger)hoverWaitMs;
 @end
 
 @implementation AppController {
@@ -122,16 +107,11 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
     BOOL                _userEnabled;
-    BOOL                _hoverPrimingEnabled;   // default NO (fast path)
-    NSInteger           _hoverWaitMs;           // default 300 — single wait between cursor move and click
-    NSTextField        *_hoverWaitLabel;        // shows current ms value next to the slider
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
 }
 
 - (void)loadConfig {
-    _hoverPrimingEnabled = NO;
-    _hoverWaitMs = 300;
     _ignoreApps = [NSSet set];
     _disableKey = DisableKeyControl;
     NSString *path = [@"~/.PreClickFocus" stringByExpandingTildeInPath];
@@ -160,13 +140,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             if ([value isEqualToString:@"option"])        _disableKey = DisableKeyOption;
             else if ([value isEqualToString:@"disabled"]) _disableKey = DisableKeyNone;
             else                                          _disableKey = DisableKeyControl;
-        } else if ([key isEqualToString:@"hoverPriming"]) {
-            _hoverPrimingEnabled = [value isEqualToString:@"true"];
-        } else if ([key isEqualToString:@"hoverWaitMs"]) {
-            NSInteger v = value.integerValue;
-            if (v < 0)    v = 0;
-            if (v > 2000) v = 2000;
-            _hoverWaitMs = v;
         }
     }
 }
@@ -179,12 +152,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     const char *keyName = (_disableKey == DisableKeyOption) ? "option" :
                           (_disableKey == DisableKeyNone)   ? "disabled" : "control";
     printf("PreClickFocus: disableKey = %s\n", keyName);
-    printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
-    printf("PreClickFocus: hoverWaitMs = %ld\n", (long)_hoverWaitMs);
 }
-
-- (BOOL)hoverPrimingEnabled    { return _hoverPrimingEnabled; }
-- (NSInteger)hoverWaitMs       { return _hoverWaitMs; }
 
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event {
     if (_disableKey != DisableKeyNone) {
@@ -230,28 +198,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _toggleItem.state   = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
     _toggleItem.enabled = YES;
     [menu addItem:_toggleItem];
-    [menu addItem:[NSMenuItem separatorItem]];
-    // ── Hover Priming submenu ────────────────────────────────────────────────
-    NSMenuItem *hoverParent = [[NSMenuItem alloc] initWithTitle:@"Hover Priming"
-                                                         action:nil
-                                                  keyEquivalent:@""];
-    hoverParent.enabled = YES;
-    NSMenu *hoverSub = [[NSMenu alloc] init];
-    [hoverSub setAutoenablesItems:NO];
-    // "Enabled" toggle item
-    NSMenuItem *hoverEnabledItem = [[NSMenuItem alloc] initWithTitle:@"Enabled"
-                                                              action:@selector(toggleHoverPriming:)
-                                                       keyEquivalent:@""];
-    hoverEnabledItem.target  = self;
-    hoverEnabledItem.state   = _hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    hoverEnabledItem.enabled = YES;
-    [hoverSub addItem:hoverEnabledItem];
-    [hoverSub addItem:[NSMenuItem separatorItem]];
-    // Single adjustable hover-wait delay, controlled by an embedded NSSlider.
-    [hoverSub addItem:[self buildHoverWaitSliderItem]];
-    [hoverSub addItem:[NSMenuItem separatorItem]];
-    hoverParent.submenu = hoverSub;
-    [menu addItem:hoverParent];
     [menu addItem:[NSMenuItem separatorItem]];
     _loginItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login" action:@selector(toggleLoginItem:) keyEquivalent:@""];
     _loginItem.target  = self;
@@ -301,54 +247,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     }
 }
 
-- (void)toggleHoverPriming:(id)sender {
-    _hoverPrimingEnabled = !_hoverPrimingEnabled;
-    [sender setState:_hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff];
-    printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
-}
-
-- (NSMenuItem *)buildHoverWaitSliderItem {
-    NSMenuItem *item = [[NSMenuItem alloc] init];
-    item.enabled = YES;
-
-    // Container view holding the label + slider.
-    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 220, 56)];
-
-    // Label: "Hover wait: 300 ms"
-    _hoverWaitLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 32, 180, 18)];
-    _hoverWaitLabel.editable        = NO;
-    _hoverWaitLabel.selectable      = NO;
-    _hoverWaitLabel.bordered        = NO;
-    _hoverWaitLabel.backgroundColor = [NSColor clearColor];
-    _hoverWaitLabel.stringValue     = [NSString stringWithFormat:@"Hover wait: %ld ms", (long)_hoverWaitMs];
-    [container addSubview:_hoverWaitLabel];
-
-    // Slider: 0–2000 ms, continuous so the label updates live while dragging.
-    NSSlider *slider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 6, 180, 22)];
-    slider.minValue    = 0;
-    slider.maxValue    = 2000;
-    slider.doubleValue = (double)_hoverWaitMs;
-    slider.continuous  = YES;
-    slider.target      = self;
-    slider.action      = @selector(hoverWaitSliderChanged:);
-    [container addSubview:slider];
-
-    item.view = container;
-    return item;
-}
-
-- (void)hoverWaitSliderChanged:(NSSlider *)sender {
-    // Round to the nearest 10 ms and clamp to the valid range.
-    NSInteger v = ((NSInteger)(sender.doubleValue + 5) / 10) * 10;
-    if (v < 0)    v = 0;
-    if (v > 2000) v = 2000;
-    _hoverWaitMs = v;
-    // Live-update the label only — do NOT rebuild the menu, which would destroy
-    // the slider view mid-drag.
-    _hoverWaitLabel.stringValue = [NSString stringWithFormat:@"Hover wait: %ld ms", (long)_hoverWaitMs];
-    printf("PreClickFocus: hoverWaitMs = %ld\n", (long)_hoverWaitMs);
-}
-
 - (void)installEventTap {
     if (_tap && CFMachPortIsValid(_tap)) return;
     if (_tap) [self removeEventTap];
@@ -394,10 +292,6 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 @end
 
-// Marker written onto every synthetic event so the tap's passthrough guard
-// can recognise and ignore them, preventing feedback loops.
-static const int64_t kPCFSyntheticTag = 0x50434600; // "PCF\0"
-
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                                    CGEventRef event, void *refcon) {
     AppController *controller = (__bridge AppController *)refcon;
@@ -405,53 +299,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         [controller reEnableTap];
         return NULL;
     }
-    // Passthrough guard: ignore synthetic events we posted to avoid feedback loops.
-    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kPCFSyntheticTag)
-        return event;
-
     if (type != kCGEventLeftMouseDown) return event;
     CGPoint point = CGEventGetLocation(event);
-    double tHit0 = nowMs();   // TEMP PROFILING
     pid_t pid = pidOfWindowUnderCursor(point);
-    double hitTestMs = nowMs() - tHit0;  // TEMP PROFILING
     if (pid != -1 && pid != frontmostPID() &&
         ![controller shouldSkipFocusForPID:pid event:event]) {
-        focusAppWindow(pid, point, hitTestMs);
-
-        if ([controller hoverPrimingEnabled]) {
-            // MODE 2 — Hover Priming ON (slow path, reliable hover state):
-            // Consume the original click and replace it with a physical cursor
-            // move → single adjustable wait → synthetic down + up, so the target
-            // view has time to register hover state / show popups before the click.
-            int64_t clickState = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
-            NSInteger wait     = [controller hoverWaitMs];  // capture before async
-            dispatch_async(dispatch_get_main_queue(), ^{
-                // Physically move the cursor to the click point — this triggers real
-                // hover/tracking detection in all apps (including Chrome/Electron).
-                CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
-
-                // Wait the single adjustable delay for hover state / popups to appear.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)(wait * NSEC_PER_MSEC)),
-                               dispatch_get_main_queue(), ^{
-
-                    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
-                                                              point, kCGMouseButtonLeft);
-                    CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
-                                                              point, kCGMouseButtonLeft);
-                    if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
-                    if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
-                    if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
-                    if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
-                    if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
-                    if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
-                });
-            });
-            return NULL; // original consumed; synthetic sequence replaces it
-        }
-        // MODE 1 — Hover Priming OFF (fast path, zero added latency):
-        // Focus happened; return original event unchanged — no synthetics, no dispatch.
+        focusAppWindow(pid, point);
     }
+    // Always deliver the original click unchanged — never consume a real mouse-down.
     return event;
 }
 
