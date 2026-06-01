@@ -110,6 +110,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup;
 - (void)reEnableTap;
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event;
+- (BOOL)hoverPrimingEnabled;
 @end
 
 @implementation AppController {
@@ -120,11 +121,13 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
     BOOL                _userEnabled;
+    BOOL                _hoverPrimingEnabled;   // default YES
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
 }
 
 - (void)loadConfig {
+    _hoverPrimingEnabled = YES;
     _ignoreApps = [NSSet set];
     _disableKey = DisableKeyControl;
     NSString *path = [@"~/.PreClickFocus" stringByExpandingTildeInPath];
@@ -153,6 +156,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             if ([value isEqualToString:@"option"])        _disableKey = DisableKeyOption;
             else if ([value isEqualToString:@"disabled"]) _disableKey = DisableKeyNone;
             else                                          _disableKey = DisableKeyControl;
+        } else if ([key isEqualToString:@"hoverPriming"]) {
+            _hoverPrimingEnabled = ![value isEqualToString:@"false"];
         }
     }
 }
@@ -165,7 +170,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     const char *keyName = (_disableKey == DisableKeyOption) ? "option" :
                           (_disableKey == DisableKeyNone)   ? "disabled" : "control";
     printf("PreClickFocus: disableKey = %s\n", keyName);
+    printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
 }
+
+- (BOOL)hoverPrimingEnabled { return _hoverPrimingEnabled; }
 
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event {
     if (_disableKey != DisableKeyNone) {
@@ -211,6 +219,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _toggleItem.state   = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
     _toggleItem.enabled = YES;
     [menu addItem:_toggleItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *hoverItem = [[NSMenuItem alloc] initWithTitle:@"Hover Priming"
+                                                       action:@selector(toggleHoverPriming:)
+                                                keyEquivalent:@""];
+    hoverItem.target  = self;
+    hoverItem.state   = _hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    hoverItem.enabled = YES;
+    [menu addItem:hoverItem];
     [menu addItem:[NSMenuItem separatorItem]];
     _loginItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login" action:@selector(toggleLoginItem:) keyEquivalent:@""];
     _loginItem.target  = self;
@@ -260,6 +276,12 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     }
 }
 
+- (void)toggleHoverPriming:(id)sender {
+    _hoverPrimingEnabled = !_hoverPrimingEnabled;
+    [sender setState:_hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+    printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
+}
+
 - (void)installEventTap {
     if (_tap && CFMachPortIsValid(_tap)) return;
     if (_tap) [self removeEventTap];
@@ -305,6 +327,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 @end
 
+// Marker written onto every synthetic event we post so the tap can
+// recognise and pass them through without re-processing.
+static const int64_t kPCFSyntheticTag = 0x50434600; // "PCF\0"
+
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                                    CGEventRef event, void *refcon) {
     AppController *controller = (__bridge AppController *)refcon;
@@ -312,6 +338,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         [controller reEnableTap];
         return NULL;
     }
+    // Part B: pass our own synthetic events straight through — no re-processing.
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kPCFSyntheticTag)
+        return event;
+
     if (type != kCGEventLeftMouseDown) return event;
     CGPoint point = CGEventGetLocation(event);
     double tHit0 = nowMs();   // TEMP PROFILING
@@ -320,13 +350,31 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     if (pid != -1 && pid != frontmostPID() &&
         ![controller shouldSkipFocusForPID:pid event:event]) {
         focusAppWindow(pid, point, hitTestMs);
-        // Prime hover/tracking state at the cursor position so hover-dependent
-        // UI elements react to the click that is about to be delivered.
-        CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
-                                                  point, kCGMouseButtonLeft);
-        if (move) {
-            CGEventPost(kCGHIDEventTap, move);
-            CFRelease(move);
+
+        if ([controller hoverPrimingEnabled]) {
+            // Capture click-state so double-click detection survives the re-post.
+            int64_t clickState = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
+            // Consume the original down; schedule a clean move→down→up on the
+            // next run-loop tick so our synthetics never interleave with the
+            // in-flight event.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                CGEventRef mv   = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                          point, kCGMouseButtonLeft);
+                CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
+                                                          point, kCGMouseButtonLeft);
+                CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
+                                                          point, kCGMouseButtonLeft);
+                if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
+                if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
+                // Tag all three so the tap's passthrough guard above ignores them.
+                if (mv)   CGEventSetIntegerValueField(mv,   kCGEventSourceUserData, kPCFSyntheticTag);
+                if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
+                if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
+                if (mv)   { CGEventPost(kCGHIDEventTap, mv);   CFRelease(mv);   }
+                if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
+                if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+            });
+            return NULL; // original consumed; synthetic sequence replaces it
         }
     }
     return event;
