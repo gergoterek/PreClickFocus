@@ -111,6 +111,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)reEnableTap;
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event;
 - (BOOL)hoverPrimingEnabled;
+- (NSInteger)preNudgeDelayMs;
 - (NSInteger)hoverDelayMs;
 - (NSInteger)clickDelayMs;
 @end
@@ -124,6 +125,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     BOOL                _enabled;
     BOOL                _userEnabled;
     BOOL                _hoverPrimingEnabled;   // default NO (fast path)
+    NSInteger           _preNudgeDelayMs;       // default 80  — wait after focus before nudging
     NSInteger           _hoverDelayMs;          // default 300 — hover settle time after cursor nudge
     NSInteger           _clickDelayMs;          // default 50  — gap between cursor restore and click
     NSSet<NSString *>  *_ignoreApps;
@@ -132,6 +134,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 - (void)loadConfig {
     _hoverPrimingEnabled = NO;
+    _preNudgeDelayMs = 80;
     _hoverDelayMs = 300;
     _clickDelayMs = 50;
     _ignoreApps = [NSSet set];
@@ -164,6 +167,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             else                                          _disableKey = DisableKeyControl;
         } else if ([key isEqualToString:@"hoverPriming"]) {
             _hoverPrimingEnabled = [value isEqualToString:@"true"];
+        } else if ([key isEqualToString:@"preNudgeDelayMs"]) {
+            _preNudgeDelayMs = value.integerValue;
         } else if ([key isEqualToString:@"hoverDelayMs"]) {
             _hoverDelayMs = value.integerValue;
         } else if ([key isEqualToString:@"clickDelayMs"]) {
@@ -181,13 +186,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                           (_disableKey == DisableKeyNone)   ? "disabled" : "control";
     printf("PreClickFocus: disableKey = %s\n", keyName);
     printf("PreClickFocus: hoverPriming = %s\n", _hoverPrimingEnabled ? "on" : "off");
+    printf("PreClickFocus: preNudgeDelayMs = %ld\n", (long)_preNudgeDelayMs);
     printf("PreClickFocus: hoverDelayMs = %ld\n", (long)_hoverDelayMs);
     printf("PreClickFocus: clickDelayMs = %ld\n", (long)_clickDelayMs);
 }
 
-- (BOOL)hoverPrimingEnabled { return _hoverPrimingEnabled; }
-- (NSInteger)hoverDelayMs   { return _hoverDelayMs; }
-- (NSInteger)clickDelayMs   { return _clickDelayMs; }
+- (BOOL)hoverPrimingEnabled    { return _hoverPrimingEnabled; }
+- (NSInteger)preNudgeDelayMs   { return _preNudgeDelayMs; }
+- (NSInteger)hoverDelayMs      { return _hoverDelayMs; }
+- (NSInteger)clickDelayMs      { return _clickDelayMs; }
 
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event {
     if (_disableKey != DisableKeyNone) {
@@ -250,6 +257,13 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     hoverEnabledItem.enabled = YES;
     [hoverSub addItem:hoverEnabledItem];
     [hoverSub addItem:[NSMenuItem separatorItem]];
+    // Pre-Nudge Delay sub-submenu
+    NSMenuItem *preNudgeItem = [[NSMenuItem alloc] initWithTitle:@"Pre-Nudge Delay"
+                                                          action:nil
+                                                   keyEquivalent:@""];
+    preNudgeItem.enabled = YES;
+    preNudgeItem.submenu = [self buildPreNudgeDelaySubmenu];
+    [hoverSub addItem:preNudgeItem];
     // Hover Delay sub-submenu
     NSMenuItem *hoverDelayItem = [[NSMenuItem alloc] initWithTitle:@"Hover Delay"
                                                             action:nil
@@ -356,6 +370,29 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     return sub;
 }
 
+- (NSMenu *)buildPreNudgeDelaySubmenu {
+    NSMenu *sub = [[NSMenu alloc] init];
+    [sub setAutoenablesItems:NO];
+    for (NSNumber *v in @[@0, @50, @80, @150, @300]) {
+        NSInteger ms = v.integerValue;
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%ld ms", (long)ms]
+                                                      action:@selector(setPreNudgeDelay:)
+                                               keyEquivalent:@""];
+        item.target  = self;
+        item.tag     = ms;
+        item.state   = (ms == _preNudgeDelayMs) ? NSControlStateValueOn : NSControlStateValueOff;
+        item.enabled = YES;
+        [sub addItem:item];
+    }
+    return sub;
+}
+
+- (void)setPreNudgeDelay:(NSMenuItem *)sender {
+    _preNudgeDelayMs = sender.tag;
+    [self rebuildMenu];
+    printf("PreClickFocus: preNudgeDelayMs = %ld\n", (long)_preNudgeDelayMs);
+}
+
 - (void)setHoverDelay:(NSMenuItem *)sender {
     _hoverDelayMs = sender.tag;
     [self rebuildMenu];
@@ -443,37 +480,44 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             // move → 150ms delay → down + up sequence so the target view
             // has time to process the move and set hover-highlight state
             // before the click arrives. No interaction with the in-flight event.
-            int64_t clickState   = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
-            NSInteger hoverDelay = [controller hoverDelayMs];  // capture before async
-            NSInteger clickDelay = [controller clickDelayMs];
+            int64_t clickState    = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
+            NSInteger preNudge    = [controller preNudgeDelayMs];  // capture before async
+            NSInteger hoverDelay  = [controller hoverDelayMs];
+            NSInteger clickDelay  = [controller clickDelayMs];
             dispatch_async(dispatch_get_main_queue(), ^{
-                // Physical nudge to trigger real hover detection
-                CGDisplayMoveCursorToPoint(CGMainDisplayID(),
-                                           CGPointMake(point.x + 2, point.y));
 
-                // Wait _hoverDelayMs for hover state to settle
+                // Stage 1: wait preNudgeDelayMs for window to finish activating
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)(hoverDelay * NSEC_PER_MSEC)),
+                                             (int64_t)(preNudge * NSEC_PER_MSEC)),
                                dispatch_get_main_queue(), ^{
 
-                    // Restore cursor to exact click position
-                    CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+                    // Stage 2: physically nudge cursor to trigger hover detection
+                    CGDisplayMoveCursorToPoint(CGMainDisplayID(),
+                                               CGPointMake(point.x + 2, point.y));
 
-                    // Wait _clickDelayMs before posting the click
+                    // Stage 3: wait hoverDelayMs for hover state to settle
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                                 (int64_t)(clickDelay * NSEC_PER_MSEC)),
+                                                 (int64_t)(hoverDelay * NSEC_PER_MSEC)),
                                    dispatch_get_main_queue(), ^{
 
-                        CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
-                                                                  point, kCGMouseButtonLeft);
-                        CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
-                                                                  point, kCGMouseButtonLeft);
-                        if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
-                        if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
-                        if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
-                        if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
-                        if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
-                        if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+                        // Stage 4: restore cursor + wait clickDelayMs + post click
+                        CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                     (int64_t)(clickDelay * NSEC_PER_MSEC)),
+                                       dispatch_get_main_queue(), ^{
+
+                            CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
+                                                                      point, kCGMouseButtonLeft);
+                            CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
+                                                                      point, kCGMouseButtonLeft);
+                            if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
+                            if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
+                            if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
+                            if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
+                            if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
+                            if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+                        });
                     });
                 });
             });
