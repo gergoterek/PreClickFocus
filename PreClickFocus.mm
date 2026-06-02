@@ -159,33 +159,36 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup {
     [self loadConfig];
     [self logConfig];
-    NSLog(@"PreClickFocus: AXIsProcessTrusted = %d", AXIsProcessTrusted());
     [self setupStatusBar];
 
-    if (AXIsProcessTrusted()) {
-        [self installEventTap];
+    // Always attempt tap creation directly.
+    // CGEventTapCreate has its own TCC check that works even when
+    // AXIsProcessTrusted() gives a stale result.
+    [self installEventTap];
+
+    if (_enabled) {
+        // Tap installed successfully — sync the menu to show Enabled.
+        [self rebuildMenu];
         return;
     }
 
-    // Not yet trusted: show the system prompt once...
+    // Tap creation failed — not trusted yet.
+    // Register in System Settings and show the native permission dialog.
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
 
-    // ...then poll until permission is granted and install the tap live.
+    // Poll every second, retrying tap creation until it succeeds.
     __weak AppController *weakSelf = self;
-    static NSTimer *trustTimer = nil;
-    trustTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
-                                                 repeats:YES
-                                                   block:^(NSTimer *t) {
-        if (AXIsProcessTrusted()) {
+    [NSTimer scheduledTimerWithTimeInterval:1.0
+                                    repeats:YES
+                                      block:^(NSTimer *t) {
+        AppController *s = weakSelf;
+        if (!s) { [t invalidate]; return; }
+        [s installEventTap];
+        if (s->_enabled) {
             [t invalidate];
-            AppController *s = weakSelf;
-            if (s) {
-                [s installEventTap];
-                [s rebuildMenu];
-                printf("PreClickFocus: permission granted, tap installed\n");
-                NSLog(@"PreClickFocus: permission granted, tap installed");
-            }
+            [s rebuildMenu];
+            NSLog(@"PreClickFocus: permission granted, tap installed");
         }
     }];
 }
