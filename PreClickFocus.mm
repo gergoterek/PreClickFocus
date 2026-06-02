@@ -470,6 +470,15 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(preN * NSEC_PER_MSEC)),
                            dispatch_get_main_queue(), ^{
                 CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+                // Also post a real mouseMoved event so NSTrackingArea and
+                // Electron/Chrome apps receive the hover callback.
+                CGEventRef moveEvent = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                               point, kCGMouseButtonLeft);
+                if (moveEvent) {
+                    CGEventSetIntegerValueField(moveEvent, kCGEventSourceUserData, kPCFSyntheticTag);
+                    CGEventPost(kCGHIDEventTap, moveEvent);
+                    CFRelease(moveEvent);
+                }
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hoverW * NSEC_PER_MSEC)),
                                dispatch_get_main_queue(), ^{
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(clickW * NSEC_PER_MSEC)),
