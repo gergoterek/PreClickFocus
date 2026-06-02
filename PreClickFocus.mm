@@ -68,6 +68,7 @@ static void focusAppWindow(pid_t pid, CGPoint point) {
     NSString *name = app.localizedName ?: @"?";
     [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
     printf("PreClickFocus: focused PID %d (%s)\n", pid, name.UTF8String);
+    NSLog(@"PreClickFocus: focused PID %d (%@)", pid, name);
 }
 
 typedef NS_ENUM(NSInteger, DisableKeyMode) {
@@ -158,6 +159,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup {
     [self loadConfig];
     [self logConfig];
+    NSLog(@"PreClickFocus: AXIsProcessTrusted = %d", AXIsProcessTrusted());
     [self setupStatusBar];
 
     if (AXIsProcessTrusted()) {
@@ -182,6 +184,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                 [s installEventTap];
                 [s rebuildMenu];
                 printf("PreClickFocus: permission granted, tap installed\n");
+                NSLog(@"PreClickFocus: permission granted, tap installed");
             }
         }
     }];
@@ -262,6 +265,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                             mask, eventTapCallback, (__bridge void *)self);
     if (!_tap) {
         fprintf(stderr, "PreClickFocus: failed to create event tap. Check Accessibility permission.\n");
+        NSLog(@"PreClickFocus: FAILED to create event tap (not trusted or denied)");
         _enabled = NO;
         return;
     }
@@ -271,6 +275,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _enabled     = YES;
     _userEnabled = YES;
     printf("PreClickFocus: running (PID %d)\n", getpid());
+    NSLog(@"PreClickFocus: running (PID %d)", getpid());
 }
 
 - (void)removeEventTap {
