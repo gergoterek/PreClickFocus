@@ -467,20 +467,44 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         NSInteger hoverW = [controller hoverWaitMs];
         NSInteger clickW = [controller clickWaitMs];
         dispatch_async(dispatch_get_main_queue(), ^{
+            // Stage 1: preNudge — wait for window activation
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(preN * NSEC_PER_MSEC)),
                            dispatch_get_main_queue(), ^{
+
+                // Stage 2: physical move + mouseMoved event to trigger tracking
                 CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
-                // Also post a real mouseMoved event so NSTrackingArea and
-                // Electron/Chrome apps receive the hover callback.
-                CGEventRef moveEvent = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
-                                                               point, kCGMouseButtonLeft);
-                if (moveEvent) {
-                    CGEventSetIntegerValueField(moveEvent, kCGEventSourceUserData, kPCFSyntheticTag);
-                    CGEventPost(kCGHIDEventTap, moveEvent);
-                    CFRelease(moveEvent);
+                CGEventRef move1 = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, point, kCGMouseButtonLeft);
+                if (move1) {
+                    CGEventSetIntegerValueField(move1, kCGEventSourceUserData, kPCFSyntheticTag);
+                    CGEventPost(kCGHIDEventTap, move1);
+                    CFRelease(move1);
                 }
+
+                // Stage 3: hoverWait — let hover state appear
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hoverW * NSEC_PER_MSEC)),
                                dispatch_get_main_queue(), ^{
+
+                    // Stage 4: second nudge to re-trigger tracking now that app is frontmost
+                    CGDisplayMoveCursorToPoint(CGMainDisplayID(),
+                                               CGPointMake(point.x + 1, point.y));
+                    CGEventRef move2 = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                               CGPointMake(point.x + 1, point.y),
+                                                               kCGMouseButtonLeft);
+                    if (move2) {
+                        CGEventSetIntegerValueField(move2, kCGEventSourceUserData, kPCFSyntheticTag);
+                        CGEventPost(kCGHIDEventTap, move2);
+                        CFRelease(move2);
+                    }
+                    CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+                    CGEventRef move3 = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                               point, kCGMouseButtonLeft);
+                    if (move3) {
+                        CGEventSetIntegerValueField(move3, kCGEventSourceUserData, kPCFSyntheticTag);
+                        CGEventPost(kCGHIDEventTap, move3);
+                        CFRelease(move3);
+                    }
+
+                    // Stage 5: clickWait then synthetic click
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(clickW * NSEC_PER_MSEC)),
                                    dispatch_get_main_queue(), ^{
                         CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
