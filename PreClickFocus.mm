@@ -66,7 +66,12 @@ static void focusAppWindow(pid_t pid, CGPoint point) {
     CFRelease(appElement);
     NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     NSString *name = app.localizedName ?: @"?";
-    [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+    if (@available(macOS 14.0, *)) {
+        [app activateFromApplication:[NSRunningApplication currentApplication]
+                             options:0];
+    } else {
+        [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+    }
     printf("PreClickFocus: focused PID %d (%s)\n", pid, name.UTF8String);
     NSLog(@"PreClickFocus: focused PID %d (%@)", pid, name);
 }
@@ -319,6 +324,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     pid_t pid = pidOfWindowUnderCursor(point);
     if (pid != -1 && pid != frontmostPID() &&
         ![controller shouldSkipFocusForPID:pid event:event]) {
+        NSLog(@"PreClickFocus: attempting focus on PID %d", pid);
         focusAppWindow(pid, point);
     }
     return event;
