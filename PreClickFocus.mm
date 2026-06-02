@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <math.h>
 
 static pid_t frontmostPID(void) {
     NSRunningApplication *app = [[NSWorkspace sharedWorkspace] frontmostApplication];
@@ -90,6 +91,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 - (void)setup;
 - (void)reEnableTap;
 - (BOOL)shouldSkipFocusForPID:(pid_t)pid event:(CGEventRef)event;
+- (BOOL)hoverPrimingEnabled;
+- (NSInteger)preNudgeMs;
+- (NSInteger)hoverWaitMs;
+- (NSInteger)clickWaitMs;
 @end
 
 @implementation AppController {
@@ -100,11 +105,22 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     CFRunLoopSourceRef  _tapSource;
     BOOL                _enabled;
     BOOL                _userEnabled;
+    BOOL                _hoverPrimingEnabled;   // default NO
+    NSInteger           _preNudgeMs;            // default 80
+    NSInteger           _hoverWaitMs;           // default 300
+    NSInteger           _clickWaitMs;           // default 50
+    NSTextField        *_preNudgeLabel;
+    NSTextField        *_hoverWaitLabel;
+    NSTextField        *_clickWaitLabel;
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
 }
 
 - (void)loadConfig {
+    _hoverPrimingEnabled = NO;
+    _preNudgeMs  = 80;
+    _hoverWaitMs = 300;
+    _clickWaitMs = 50;
     _ignoreApps = [NSSet set];
     _disableKey = DisableKeyControl;
     NSString *path = [@"~/.PreClickFocus" stringByExpandingTildeInPath];
@@ -133,6 +149,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             if ([value isEqualToString:@"option"])        _disableKey = DisableKeyOption;
             else if ([value isEqualToString:@"disabled"]) _disableKey = DisableKeyNone;
             else                                          _disableKey = DisableKeyControl;
+        } else if ([key isEqualToString:@"hoverPriming"]) {
+            _hoverPrimingEnabled = [value isEqualToString:@"true"];
+        } else if ([key isEqualToString:@"preNudgeMs"]) {
+            NSInteger v = value.integerValue; if (v < 0) v = 0; if (v > 2000) v = 2000; _preNudgeMs = v;
+        } else if ([key isEqualToString:@"hoverWaitMs"]) {
+            NSInteger v = value.integerValue; if (v < 0) v = 0; if (v > 2000) v = 2000; _hoverWaitMs = v;
+        } else if ([key isEqualToString:@"clickWaitMs"]) {
+            NSInteger v = value.integerValue; if (v < 0) v = 0; if (v > 2000) v = 2000; _clickWaitMs = v;
         }
     }
 }
@@ -204,6 +228,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     if (!icon) icon = [NSImage imageWithSystemSymbolName:@"cursorarrow.rays" accessibilityDescription:@"PreClickFocus"];
     if (icon) { [icon setTemplate:YES]; _statusItem.button.image = icon; }
     else { _statusItem.button.title = @"PCF"; }
+    // Show menu on both left and right click.
+    [_statusItem.button sendActionOn:NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown];
     [self rebuildMenu];
 }
 
@@ -216,6 +242,32 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _toggleItem.state   = _enabled ? NSControlStateValueOn : NSControlStateValueOff;
     _toggleItem.enabled = YES;
     [menu addItem:_toggleItem];
+    // Restart Tap — manually re-creates the event tap (useful if it gets stuck).
+    NSMenuItem *restartItem = [[NSMenuItem alloc] initWithTitle:@"Restart Tap"
+                                                         action:@selector(restartTap:)
+                                                  keyEquivalent:@"r"];
+    restartItem.target  = self;
+    restartItem.enabled = YES;
+    [menu addItem:restartItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+    // ── Hover Priming submenu ────────────────────────────────────────────────
+    NSMenuItem *hoverParent = [[NSMenuItem alloc] initWithTitle:@"Hover Priming" action:nil keyEquivalent:@""];
+    hoverParent.enabled = YES;
+    NSMenu *hoverSubmenu = [[NSMenu alloc] init];
+    [hoverSubmenu setAutoenablesItems:NO];
+    NSMenuItem *hoverToggle = [[NSMenuItem alloc] initWithTitle:@"Enabled"
+                                                         action:@selector(toggleHoverPriming:)
+                                                  keyEquivalent:@""];
+    hoverToggle.target  = self;
+    hoverToggle.state   = _hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    hoverToggle.enabled = YES;
+    [hoverSubmenu addItem:hoverToggle];
+    [hoverSubmenu addItem:[NSMenuItem separatorItem]];
+    [hoverSubmenu addItem:[self sliderItemWithTitle:@"Pre-nudge"  value:_preNudgeMs  label:&_preNudgeLabel  action:@selector(preNudgeSliderChanged:)]];
+    [hoverSubmenu addItem:[self sliderItemWithTitle:@"Hover wait" value:_hoverWaitMs label:&_hoverWaitLabel action:@selector(hoverWaitSliderChanged:)]];
+    [hoverSubmenu addItem:[self sliderItemWithTitle:@"Click wait" value:_clickWaitMs label:&_clickWaitLabel action:@selector(clickWaitSliderChanged:)]];
+    [hoverParent setSubmenu:hoverSubmenu];
+    [menu addItem:hoverParent];
     [menu addItem:[NSMenuItem separatorItem]];
     _loginItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login" action:@selector(toggleLoginItem:) keyEquivalent:@""];
     _loginItem.target  = self;
@@ -262,6 +314,75 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             _toggleItem.title = @"PreClickFocus: Enabled";
             _toggleItem.state = NSControlStateValueOn;
         }
+    }
+}
+
+// ── Hover priming accessors (called from C callback) ─────────────────────────
+
+- (BOOL)hoverPrimingEnabled { return _hoverPrimingEnabled; }
+- (NSInteger)preNudgeMs     { return _preNudgeMs; }
+- (NSInteger)hoverWaitMs    { return _hoverWaitMs; }
+- (NSInteger)clickWaitMs    { return _clickWaitMs; }
+
+// ── Generic slider menu item builder ─────────────────────────────────────────
+
+- (NSMenuItem *)sliderItemWithTitle:(NSString *)title
+                              value:(NSInteger)value
+                              label:(NSTextField * __strong *)labelOut
+                             action:(SEL)action {
+    NSMenuItem *item = [[NSMenuItem alloc] init];
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 240, 56)];
+    NSTextField *label = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 32, 200, 18)];
+    label.editable = NO; label.bordered = NO;
+    label.backgroundColor = [NSColor clearColor];
+    label.stringValue = [NSString stringWithFormat:@"%@: %ld ms", title, (long)value];
+    [container addSubview:label];
+    NSSlider *slider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 8, 200, 20)];
+    slider.minValue = 0; slider.maxValue = 2000;
+    slider.doubleValue = (double)value;
+    slider.target = self; slider.action = action;
+    slider.continuous = YES;
+    [container addSubview:slider];
+    item.view = container;
+    item.enabled = YES;
+    *labelOut = label;
+    return item;
+}
+
+// ── Slider actions ────────────────────────────────────────────────────────────
+
+- (void)preNudgeSliderChanged:(NSSlider *)s {
+    _preNudgeMs = (NSInteger)llround(s.doubleValue / 10.0) * 10;
+    _preNudgeLabel.stringValue = [NSString stringWithFormat:@"Pre-nudge: %ld ms", (long)_preNudgeMs];
+}
+
+- (void)hoverWaitSliderChanged:(NSSlider *)s {
+    _hoverWaitMs = (NSInteger)llround(s.doubleValue / 10.0) * 10;
+    _hoverWaitLabel.stringValue = [NSString stringWithFormat:@"Hover wait: %ld ms", (long)_hoverWaitMs];
+}
+
+- (void)clickWaitSliderChanged:(NSSlider *)s {
+    _clickWaitMs = (NSInteger)llround(s.doubleValue / 10.0) * 10;
+    _clickWaitLabel.stringValue = [NSString stringWithFormat:@"Click wait: %ld ms", (long)_clickWaitMs];
+}
+
+// ── Hover priming toggle ──────────────────────────────────────────────────────
+
+- (void)toggleHoverPriming:(id)sender {
+    _hoverPrimingEnabled = !_hoverPrimingEnabled;
+    [sender setState:_hoverPrimingEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+    NSLog(@"PreClickFocus: hoverPriming = %s", _hoverPrimingEnabled ? "on" : "off");
+}
+
+// ── Restart tap ───────────────────────────────────────────────────────────────
+
+- (void)restartTap:(id)sender {
+    [self removeEventTap];
+    [self installEventTap];
+    if (_enabled) {
+        _toggleItem.title = @"PreClickFocus: Enabled";
+        _toggleItem.state = NSControlStateValueOn;
+        NSLog(@"PreClickFocus: tap restarted");
     }
 }
 
@@ -312,6 +433,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
 @end
 
+// Marker on synthetic events we post — lets the tap skip re-processing them.
+static const int64_t kPCFSyntheticTag = 0x50434600; // "PCF\0"
+
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                                    CGEventRef event, void *refcon) {
     AppController *controller = (__bridge AppController *)refcon;
@@ -319,6 +443,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         [controller reEnableTap];
         return NULL;
     }
+    // Skip synthetic events we posted to avoid feedback loops.
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kPCFSyntheticTag)
+        return event;
+
     if (type != kCGEventLeftMouseDown) return event;
     CGPoint point = CGEventGetLocation(event);
     pid_t pid = pidOfWindowUnderCursor(point);
@@ -326,6 +454,39 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         ![controller shouldSkipFocusForPID:pid event:event]) {
         NSLog(@"PreClickFocus: attempting focus on PID %d", pid);
         focusAppWindow(pid, point);
+
+        if (![controller hoverPrimingEnabled]) {
+            // Fast path — no hover priming, return original event unchanged.
+            return event;
+        }
+
+        // Hover priming ON: consume original click and replace it with a
+        // physically-moved cursor + timed synthetic click sequence.
+        int64_t clickState = CGEventGetIntegerValueField(event, kCGMouseEventClickState);
+        NSInteger preN   = [controller preNudgeMs];
+        NSInteger hoverW = [controller hoverWaitMs];
+        NSInteger clickW = [controller clickWaitMs];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(preN * NSEC_PER_MSEC)),
+                           dispatch_get_main_queue(), ^{
+                CGDisplayMoveCursorToPoint(CGMainDisplayID(), point);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hoverW * NSEC_PER_MSEC)),
+                               dispatch_get_main_queue(), ^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(clickW * NSEC_PER_MSEC)),
+                                   dispatch_get_main_queue(), ^{
+                        CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
+                        CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,   point, kCGMouseButtonLeft);
+                        if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
+                        if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
+                        if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
+                        if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
+                        if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
+                        if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+                    });
+                });
+            });
+        });
+        return NULL; // original consumed; synthetic sequence replaces it
     }
     return event;
 }
