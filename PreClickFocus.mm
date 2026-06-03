@@ -112,6 +112,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     NSTextField        *_preNudgeLabel;
     NSTextField        *_hoverWaitLabel;
     NSTextField        *_clickWaitLabel;
+    NSTimer            *_watchdogTimer;
     NSSet<NSString *>  *_ignoreApps;
     DisableKeyMode      _disableKey;
 }
@@ -405,9 +406,30 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     _userEnabled = YES;
     printf("PreClickFocus: running (PID %d)\n", getpid());
     NSLog(@"PreClickFocus: running (PID %d)", getpid());
+
+    // Watchdog: every 5s check the tap is still alive and restart if not.
+    [_watchdogTimer invalidate];
+    __weak AppController *weakSelf = self;
+    _watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
+                                                     repeats:YES
+                                                       block:^(NSTimer *t) {
+        AppController *s = weakSelf;
+        if (!s) { [t invalidate]; return; }
+        if (!s->_userEnabled) { [t invalidate]; return; }
+        if (!s->_tap || !CFMachPortIsValid(s->_tap)) {
+            NSLog(@"PreClickFocus: watchdog detected dead tap, restarting");
+            [s removeEventTap];
+            [s installEventTap];
+            if (!s->_enabled) {
+                NSLog(@"PreClickFocus: watchdog restart failed");
+            }
+        }
+    }];
 }
 
 - (void)removeEventTap {
+    [_watchdogTimer invalidate];
+    _watchdogTimer = nil;
     if (_tap) {
         CGEventTapEnable(_tap, false);
         if (_tapSource) {
@@ -422,12 +444,17 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 }
 
 - (void)reEnableTap {
-    if (!_userEnabled) return;
+    if (!_userEnabled) {
+        NSLog(@"PreClickFocus: reEnableTap skipped (user disabled)");
+        return;
+    }
     if (!_tap || !CFMachPortIsValid(_tap)) {
+        NSLog(@"PreClickFocus: reEnableTap re-creating tap");
         [self removeEventTap];
         [self installEventTap];
         return;
     }
+    NSLog(@"PreClickFocus: reEnableTap re-enabling");
     CGEventTapEnable(_tap, true);
 }
 
@@ -509,12 +536,22 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
                                    dispatch_get_main_queue(), ^{
                         CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
                         CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,   point, kCGMouseButtonLeft);
-                        if (down) CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
-                        if (up)   CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
-                        if (down) CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
-                        if (up)   CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
-                        if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
-                        if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up);   }
+                        if (down && up) {
+                            CGEventSetIntegerValueField(down, kCGMouseEventClickState, clickState);
+                            CGEventSetIntegerValueField(up,   kCGMouseEventClickState, clickState);
+                            CGEventSetIntegerValueField(down, kCGEventSourceUserData, kPCFSyntheticTag);
+                            CGEventSetIntegerValueField(up,   kCGEventSourceUserData, kPCFSyntheticTag);
+                            CGEventPost(kCGHIDEventTap, down);
+                            CGEventPost(kCGHIDEventTap, up);
+                        } else {
+                            NSLog(@"PreClickFocus: WARNING synthetic click create failed, delivering fallback");
+                            CGEventRef fbDown = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, point, kCGMouseButtonLeft);
+                            CGEventRef fbUp   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,   point, kCGMouseButtonLeft);
+                            if (fbDown) { CGEventPost(kCGHIDEventTap, fbDown); CFRelease(fbDown); }
+                            if (fbUp)   { CGEventPost(kCGHIDEventTap, fbUp);   CFRelease(fbUp);   }
+                        }
+                        if (down) CFRelease(down);
+                        if (up)   CFRelease(up);
                     });
                 });
             });
