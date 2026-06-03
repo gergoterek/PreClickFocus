@@ -39,6 +39,9 @@ static pid_t pidOfWindowUnderCursor(CGPoint point) {
 static void focusAppWindow(pid_t pid, CGPoint point) {
     AXUIElementRef appElement = AXUIElementCreateApplication(pid);
     if (!appElement) return;
+    // Cap IPC round-trip time to prevent slow apps from blocking the tap
+    // callback long enough to trigger kCGEventTapDisabledByTimeout.
+    AXUIElementSetMessagingTimeout(appElement, 0.5f);
     CFArrayRef windows = NULL;
     AXError err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute, (CFTypeRef *)&windows);
     if (err != kAXErrorSuccess || !windows) { CFRelease(appElement); return; }
@@ -408,7 +411,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     NSLog(@"PreClickFocus: running (PID %d)", getpid());
 
     // Watchdog: every 5s check the tap is still alive and restart if not.
-    [_watchdogTimer invalidate];
+    // Guard: don't create a second timer if one is already running.
+    if (_watchdogTimer) return;
     __weak AppController *weakSelf = self;
     _watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
                                                      repeats:YES
@@ -444,18 +448,19 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 }
 
 - (void)reEnableTap {
-    if (!_userEnabled) {
-        NSLog(@"PreClickFocus: reEnableTap skipped (user disabled)");
-        return;
-    }
-    if (!_tap || !CFMachPortIsValid(_tap)) {
-        NSLog(@"PreClickFocus: reEnableTap re-creating tap");
-        [self removeEventTap];
-        [self installEventTap];
-        return;
-    }
-    NSLog(@"PreClickFocus: reEnableTap re-enabling");
-    CGEventTapEnable(_tap, true);
+    if (!_userEnabled) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!_userEnabled) return;
+        NSLog(@"PreClickFocus: reEnableTap called");
+        if (!_tap || !CFMachPortIsValid(_tap)) {
+            NSLog(@"PreClickFocus: reEnableTap — tap dead, recreating");
+            [self removeEventTap];
+            [self installEventTap];
+        } else {
+            NSLog(@"PreClickFocus: reEnableTap — re-enabling existing tap");
+            CGEventTapEnable(_tap, true);
+        }
+    });
 }
 
 @end
