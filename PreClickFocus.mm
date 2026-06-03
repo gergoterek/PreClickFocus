@@ -410,23 +410,24 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     printf("PreClickFocus: running (PID %d)\n", getpid());
     NSLog(@"PreClickFocus: running (PID %d)", getpid());
 
-    // Watchdog: every 5s check the tap is still alive and restart if not.
+    // Watchdog: every 2s ensure the tap is alive AND enabled. A tap can be
+    // disabled by the system (kCGEventTapDisabledByTimeout) while its mach
+    // port stays valid, and there is no API to query enabled state — so we
+    // unconditionally re-enable it each cycle (idempotent and cheap).
     // Guard: don't create a second timer if one is already running.
     if (_watchdogTimer) return;
-    __weak AppController *weakSelf = self;
-    _watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
+    _watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                      repeats:YES
                                                        block:^(NSTimer *t) {
-        AppController *s = weakSelf;
-        if (!s) { [t invalidate]; return; }
-        if (!s->_userEnabled) { [t invalidate]; return; }
-        if (!s->_tap || !CFMachPortIsValid(s->_tap)) {
-            NSLog(@"PreClickFocus: watchdog detected dead tap, restarting");
-            [s removeEventTap];
-            [s installEventTap];
-            if (!s->_enabled) {
-                NSLog(@"PreClickFocus: watchdog restart failed");
-            }
+        if (!_userEnabled) { [t invalidate]; _watchdogTimer = nil; return; }
+        if (!_tap || !CFMachPortIsValid(_tap)) {
+            NSLog(@"PreClickFocus: watchdog — tap dead, recreating");
+            [self removeEventTap];
+            [self installEventTap];
+        } else {
+            // Tap port is valid but may have been disabled by a timeout.
+            // Unconditionally re-enable it — idempotent if already enabled.
+            CGEventTapEnable(_tap, true);
         }
     }];
 }
